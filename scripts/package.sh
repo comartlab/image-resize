@@ -54,12 +54,8 @@ STAGING_DIR="$(mktemp -d "$ROOT_DIR/build/dmg-stage.XXXXXX")"
 trap 'rm -rf "$STAGING_DIR"' EXIT
 
 /usr/bin/ditto "$APP_PATH" "$STAGING_DIR/Image Resize.app"
-ln -s /Applications "$STAGING_DIR/Applications"
-# Always distribute the snapshot and notices already signed into this bundle,
-# including --skip-build. Working-tree changes cannot alter its source package.
-cp "$BUNDLED_LICENSE" "$STAGING_DIR/LICENSE.txt"
-cp "$BUNDLED_NOTICE" "$STAGING_DIR/NOTICE.txt"
-cp "$BUNDLED_SOURCE" "$STAGING_DIR/$SOURCE_ARCHIVE_NAME"
+# The disk image contains only the app. Keep the matching source and notices
+# inside its signed bundle and as separate distribution files.
 cp "$BUNDLED_SOURCE" "$SOURCE_ARCHIVE_PATH"
 cp "$BUNDLED_LICENSE" "$DIST_DIR/LICENSE.txt"
 cp "$BUNDLED_NOTICE" "$DIST_DIR/NOTICE.txt"
