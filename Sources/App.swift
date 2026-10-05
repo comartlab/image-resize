@@ -162,6 +162,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let secondValue = NSTextField(string: "1600")
     private let times = NSTextField(labelWithString: "×")
     private let unit = NSTextField(labelWithString: "px")
+    private let allowUpscaling = NSButton(checkboxWithTitle: "Allow upscaling", target: nil, action: nil)
     private let format = NSPopUpButton()
     private let quality = NSSlider(value: 90, minValue: 1, maxValue: 100, target: nil, action: nil)
     private let qualityLabel = NSTextField(labelWithString: "90%")
@@ -183,8 +184,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         var result = ResizeSettings()
         result.mode = ResizeMode.allCases[max(0, mode.indexOfSelectedItem)]
         result.width = Int(firstValue.stringValue) ?? 0
-        result.height = Int(secondValue.stringValue) ?? 0
+        result.height = result.mode == .height ? result.width : (Int(secondValue.stringValue) ?? 0)
         result.percent = Double(firstValue.stringValue) ?? 0
+        result.allowUpscaling = allowUpscaling.state == .on
         result.format = OutputFormat.allCases[max(0, format.indexOfSelectedItem)]
         result.quality = (result.format == .web ? standardQuality : quality.doubleValue) / 100
         result.webQuality = (result.format == .web ? quality.doubleValue : webQuality) / 100
@@ -323,7 +325,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             $0.widthAnchor.constraint(equalToConstant: 76).isActive = true
         }
         firstValue.setAccessibilityLabel("Target size"); secondValue.setAccessibilityLabel("Maximum height")
-        let sizeRow = row([mode, firstValue, times, secondValue, unit, flexible()])
+        allowUpscaling.target = self; allowUpscaling.action = #selector(optionsChanged(_:))
+        allowUpscaling.toolTip = "Enlarge images that are smaller than the selected size."
+        let sizeRow = row([mode, firstValue, times, secondValue, unit, flexible(), allowUpscaling])
         format.addItems(withTitles: ["Original format", "JPEG", "PNG", "TIFF", "HEIC", "Optimized for web"])
         format.selectItem(at: OutputFormat.allCases.firstIndex(of: ResizeSettings().format) ?? 1)
         format.target = self; format.action = #selector(optionsChanged(_:)); format.setAccessibilityLabel("Output format")
@@ -385,6 +389,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         if let saved = prefs.string(forKey: "format"), let index = OutputFormat.allCases.firstIndex(where: { $0.rawValue == saved }) { format.selectItem(at: index) }
         firstValue.stringValue = prefs.string(forKey: "size") ?? (mode.indexOfSelectedItem == 4 ? "50" : "1600")
         secondValue.stringValue = prefs.string(forKey: "height") ?? "1600"
+        allowUpscaling.state = prefs.bool(forKey: "allowUpscaling") ? .on : .off
         lastModeIndex = mode.indexOfSelectedItem
         pixelSize = prefs.string(forKey: "pixelSize") ?? (lastModeIndex == 4 ? "1600" : firstValue.stringValue)
         percentageSize = prefs.string(forKey: "percentageSize") ?? (lastModeIndex == 4 ? firstValue.stringValue : "50")
@@ -417,6 +422,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let prefs = UserDefaults.standard
         prefs.set(settings.mode.rawValue, forKey: "mode"); prefs.set(settings.format.rawValue, forKey: "format")
         prefs.set(firstValue.stringValue, forKey: "size"); prefs.set(secondValue.stringValue, forKey: "height")
+        prefs.set(allowUpscaling.state == .on, forKey: "allowUpscaling")
         if mode.indexOfSelectedItem == 4 { percentageSize = firstValue.stringValue }
         else { pixelSize = firstValue.stringValue }
         prefs.set(pixelSize, forKey: "pixelSize"); prefs.set(percentageSize, forKey: "percentageSize")
@@ -488,7 +494,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func validationMessage() -> String? {
         let current = settings
         if current.mode == .percent {
-            if !current.percent.isFinite || current.percent <= 0 || current.percent > 100 { return "Percent must be greater than 0 and at most 100." }
+            if !current.percent.isFinite || current.percent <= 0 { return "Percent must be greater than 0." }
+            if current.percent > 100 && !current.allowUpscaling { return "Enable Allow upscaling for percentages above 100." }
         } else if current.mode != .originalDimensions && (current.width < 1 || (current.mode == .fit && current.height < 1)) {
             return "Enter positive whole pixel sizes."
         }
@@ -502,6 +509,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let locked = busy
         [addButton, clearButton, recursive, metadata, watermark, folderButton].forEach { $0.isEnabled = !locked }
         metadata.isEnabled = !locked && settings.format != .web
+        allowUpscaling.isEnabled = !locked && settings.mode != .originalDimensions
         clearButton.isEnabled = !locked && (!items.isEmpty || importing)
         cropButton.isEnabled = !locked && !items.isEmpty
         resetCropButton.isEnabled = !locked && cropSelection != nil
@@ -536,7 +544,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private func updatePreviewState() {
         let exports = previewItem.map(willExport) ?? false
         previewButton.isEnabled = !busy && !previewPending && exports && watermark.state == .on && validationMessage() == nil
-        previewButton.toolTip = previewItem?.isInspected == false ? "Preview is loading in the background." : (exports ? "Preview the watermark. Choose Crop in the preview to crop the batch." : (cropSelection == nil ? "Images already at or below the selected size are skipped." : "Cropped images already at or below the selected size are skipped."))
+        previewButton.toolTip = previewItem?.isInspected == false ? "Preview is loading in the background." : (exports ? "Preview the watermark. Choose Crop in the preview to crop the batch." : "This image will be skipped at the selected size.")
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
         if previewSourceID != previewItem?.id { dismissPreview() }
@@ -894,9 +902,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         previewSourceID = item.id
         guard let target = try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: settings) else { return }
         var previewSettings = settings
-        let previewEdge = max(target.width, target.height)
-        previewSettings.mode = settings.mode == .originalDimensions && previewEdge <= 1200 ? .originalDimensions : .longestEdge
-        previewSettings.width = min(1200, previewEdge)
+        let previewEdge = min(1200, max(target.width, target.height))
+        // A preview at the crop's native size must still render its watermark,
+        // even when the full export enlarges it beyond the preview limit.
+        previewSettings.mode = previewEdge == max(target.cropWidth, target.cropHeight) ? .originalDimensions : .longestEdge
+        previewSettings.width = previewEdge
         previewSettings.preserveMetadata = false
         let generation = previewGeneration
         let cancellation = CancellationToken(); previewCancellation = cancellation

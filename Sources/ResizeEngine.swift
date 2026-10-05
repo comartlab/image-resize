@@ -21,6 +21,7 @@ struct ResizeSettings {
     var width: Int = 1600
     var height: Int = 1600
     var percent: Double = 50
+    var allowUpscaling: Bool = false
     var format: OutputFormat = .jpeg
     var quality: Double = 0.9
     var webQuality: Double = 0.75
@@ -66,7 +67,7 @@ struct ResizeResult {
     let height: Int
     let inputBytes: Int64
     let outputBytes: Int64
-    /// True when a reduction mode needs no shrink and writes no output file.
+    /// True when a resizing mode leaves pixel dimensions unchanged and writes no output file.
     let skipped: Bool
     let message: String
 }
@@ -114,7 +115,7 @@ enum ResizeError: Error, LocalizedError {
 }
 
 /// ImageIO decoding and encoding, CoreGraphics color management, and native
-/// Accelerate Lanczos-5 reduction. Premultiplied buffers preserve translucent
+/// Accelerate Lanczos-5 resizing. Premultiplied buffers preserve translucent
 /// edges; ordinary 8-bit images use compact byte buffers, while high-depth
 /// images retain floating-point precision during processing.
 final class ResizeEngine {
@@ -153,58 +154,80 @@ final class ResizeEngine {
         guard width > 0, height > 0 else {
             throw ResizeError.invalidSettings("Image dimensions must be positive.")
         }
-        var scale: Double
         switch settings.mode {
         case .longestEdge:
             guard settings.width > 0 else { throw ResizeError.invalidSettings("Enter a positive longest edge.") }
-            scale = Double(settings.width) / Double(max(width, height))
+            if !settings.allowUpscaling && settings.width >= max(width, height) { return (width, height) }
+            if width >= height {
+                return (settings.width, try roundedDimension(height, bound: settings.width, sourceBound: width))
+            }
+            return (try roundedDimension(width, bound: settings.width, sourceBound: height), settings.width)
         case .fit:
             guard settings.width > 0, settings.height > 0 else {
                 throw ResizeError.invalidSettings("Enter a positive width and height.")
             }
-            scale = min(Double(settings.width) / Double(width), Double(settings.height) / Double(height))
+            if !settings.allowUpscaling && settings.width >= width && settings.height >= height { return (width, height) }
+            // Compare the two scale ratios without overflowing or losing
+            // precision when positive integer bounds approach Int.max.
+            let widthLimit = UInt(settings.width).multipliedFullWidth(by: UInt(height))
+            let heightLimit = UInt(settings.height).multipliedFullWidth(by: UInt(width))
+            if widthLimit.high < heightLimit.high
+                || (widthLimit.high == heightLimit.high && widthLimit.low <= heightLimit.low) {
+                return (settings.width, min(settings.height,
+                    try roundedDimension(height, bound: settings.width, sourceBound: width)))
+            }
+            return (min(settings.width,
+                try roundedDimension(width, bound: settings.height, sourceBound: height)), settings.height)
         case .width:
             guard settings.width > 0 else { throw ResizeError.invalidSettings("Enter a positive width.") }
-            scale = Double(settings.width) / Double(width)
+            if !settings.allowUpscaling && settings.width >= width { return (width, height) }
+            return (settings.width, try roundedDimension(height, bound: settings.width, sourceBound: width))
         case .height:
             guard settings.height > 0 else { throw ResizeError.invalidSettings("Enter a positive height.") }
-            scale = Double(settings.height) / Double(height)
+            if !settings.allowUpscaling && settings.height >= height { return (width, height) }
+            return (try roundedDimension(width, bound: settings.height, sourceBound: height), settings.height)
         case .percent:
             guard settings.percent.isFinite, settings.percent > 0 else {
                 throw ResizeError.invalidSettings("Enter a positive percentage.")
             }
-            scale = settings.percent / 100
+            let requestedScale = settings.percent / 100
+            let scale = settings.allowUpscaling ? requestedScale : min(1, requestedScale)
+            return (try roundedDimension(width, scale: scale), try roundedDimension(height, scale: scale))
         case .originalDimensions:
             return (width, height)
         }
-        scale = min(1, scale)
-        // Aspect ratio is retained to the nearest whole pixel; upscaling is
-        // disallowed even when the requested bound is larger than the source.
-        var resultWidth = roundedDimension(width, scale: scale)
-        var resultHeight = roundedDimension(height, scale: scale)
-        switch settings.mode {
-        case .longestEdge:
-            resultWidth = min(resultWidth, settings.width)
-            resultHeight = min(resultHeight, settings.width)
-        case .fit:
-            resultWidth = min(resultWidth, settings.width)
-            resultHeight = min(resultHeight, settings.height)
-        case .width: resultWidth = min(resultWidth, settings.width)
-        case .height: resultHeight = min(resultHeight, settings.height)
-        case .percent, .originalDimensions: break
-        }
-        return (resultWidth, resultHeight)
     }
 
-    private static func roundedDimension(_ original: Int, scale: Double) -> Int {
-        let rounded = (Double(original) * scale).rounded()
-        // Double(Int.max) rounds up past Int's range. Compare before converting
-        // so representable positive dimensions remain safe near that boundary.
-        if rounded >= Double(original) { return original }
+    /// Anchor a pixel mode's selected edge exactly. Full-width arithmetic lets
+    /// both enlargement and reduction retain the nearest representable pixel,
+    /// including values that Double cannot distinguish near Int.max.
+    private static func roundedDimension(_ original: Int, bound: Int, sourceBound: Int) throws -> Int {
+        let product = UInt(original).multipliedFullWidth(by: UInt(bound))
+        let divisor = UInt(sourceBound)
+        guard product.high < divisor else {
+            throw ResizeError.invalidSettings("The requested output dimensions are too large to represent.")
+        }
+        let divided = divisor.dividingFullWidth(product)
+        let roundUp = divided.remainder >= divisor / 2 + divisor % 2
+        let (rounded, overflow) = divided.quotient.addingReportingOverflow(roundUp ? 1 : 0)
+        guard !overflow, rounded <= UInt(Int.max) else {
+            throw ResizeError.invalidSettings("The requested output dimensions are too large to represent.")
+        }
         return max(1, Int(rounded))
     }
 
-    /// Plan against the oriented crop before applying the no-upscale rule.
+    private static func roundedDimension(_ original: Int, scale: Double) throws -> Int {
+        if scale == 1 { return original }
+        let rounded = (Double(original) * scale).rounded()
+        // Double(Int.max) rounds past Int's range; checked conversion avoids
+        // traps for unrepresentable percentages without imposing a size cap.
+        guard rounded.isFinite, let dimension = Int(exactly: rounded) else {
+            throw ResizeError.invalidSettings("The requested output dimensions are too large to represent.")
+        }
+        return max(1, dimension)
+    }
+
+    /// Plan proportional resizing against the oriented crop.
     static func outputPlan(width: Int, height: Int, settings: ResizeSettings) throws -> ResizeOutputPlan {
         guard width > 0, height > 0 else {
             throw ResizeError.invalidSettings("Image dimensions must be positive.")
@@ -231,7 +254,9 @@ final class ResizeEngine {
         let composite = try decodedComposite(source, name: item.url.lastPathComponent)
         var settings = ResizeSettings()
         settings.mode = .longestEdge
-        settings.width = maxPixelDimension
+        // Source/crop previews are bounded thumbnails, independent of whether
+        // the actual export size enlarges its source.
+        settings.width = min(maxPixelDimension, max(current.width, current.height))
         let target = try targetSize(width: current.width, height: current.height, settings: settings)
         let result = try reducedImage(composite, orientation: orientation(properties),
                                       cropRect: CGRect(x: 0, y: 0, width: current.width, height: current.height),
@@ -291,7 +316,9 @@ final class ResizeEngine {
         if target.skipped {
             return ResizeResult(source: item.url, output: nil, width: target.width, height: target.height,
                                 inputBytes: current.fileBytes, outputBytes: 0,
-                                skipped: true, message: "Already at or below the selected size; skipped.")
+                                skipped: true, message: settings.allowUpscaling
+                                    ? "Already at the selected size; skipped."
+                                    : "Already at or below the selected size; skipped.")
         }
 
         let source = try openSource(item.url)
@@ -299,7 +326,7 @@ final class ResizeEngine {
         let photoshop = isPhotoshop(source)
         // ImageIO supplies the saved visible composite for PSD and layered
         // TIFF. Rendering it into our own pixel buffer flattens the document
-        // before reduction, retaining Photoshop's baked masks and effects.
+        // before resizing, retaining Photoshop's baked masks and effects.
         try checkCancellation(cancelled)
         let composite = try decodedComposite(source, name: item.url.lastPathComponent)
         try checkCancellation(cancelled)

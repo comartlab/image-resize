@@ -8,8 +8,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
 APP_PATH="$BUILD_DIR/Image Resize.app"
 EXECUTABLE_NAME="ImageResize"
-APP_VERSION="${APP_VERSION:-1.12}"
-APP_BUILD="${APP_BUILD:-14}"
+APP_VERSION="${APP_VERSION:-1.13}"
+APP_BUILD="${APP_BUILD:-15}"
 DEPLOYMENT_TARGET="12.0"
 
 if [[ ! "$APP_VERSION" =~ ^[0-9]+(\.[0-9]+)*$ ]] || [[ ! "$APP_BUILD" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then

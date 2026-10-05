@@ -111,7 +111,7 @@ func outputURL(_ result: ResizeResult) throws -> URL {
 
 func requireSkipped(_ result: ResizeResult, width: Int, height: Int) throws {
     try require(result.skipped && result.output == nil && result.outputBytes == 0,
-                "Fitting image did not return a skip without an output")
+                "Unchanged target did not return a skip without an output")
     try require(result.width == width && result.height == height, "Skip changed reported image dimensions")
 }
 
@@ -297,8 +297,8 @@ func watermarked(_ url: URL, text: String = "SAMPLE", longestEdge: Int = 1600,
                  format: OutputFormat = .png, strength: Double = 0.25) throws -> ResizeResult {
     let item = try ResizeEngine.inspect(url)
     var settings = ResizeSettings()
-    // Rendering regressions deliberately reduce a dimension, because fitting
-    // images now skip every output operation, including watermark drawing.
+    // Rendering regressions deliberately change a dimension, because equal
+    // target dimensions skip every output operation, including watermark drawing.
     settings.width = min(longestEdge, max(item.width, item.height) - 1)
     settings.format = format
     settings.watermarkEnabled = true
@@ -571,20 +571,58 @@ test("Aspect-preserving dimensions for every resize mode") {
     try require(percent.width == 800 && percent.height == 600, "Wrong percent dimensions")
 }
 
-test("No mode enlarges small images; extreme ratios stay nonzero") {
-    for mode in [ResizeMode.longestEdge, .fit, .width, .height, .percent] {
+test("Every resize mode enlarges small images proportionally; extreme ratios stay nonzero") {
+    let cases: [(ResizeMode, Int, Int)] = [(.longestEdge, 200, 100), (.fit, 200, 100),
+        (.width, 200, 100), (.height, 240, 120), (.percent, 120, 60)]
+    for (mode, width, height) in cases {
         var settings = ResizeSettings()
         settings.mode = mode
-        settings.width = 2000
-        settings.height = 2000
+        settings.width = 200
+        settings.height = 120
         settings.percent = 150
+        let disabled = try ResizeEngine.targetSize(width: 80, height: 40, settings: settings)
+        try require(disabled.width == 80 && disabled.height == 40, "Default settings enlarged \(mode) without opt-in")
+        settings.allowUpscaling = true
         let size = try ResizeEngine.targetSize(width: 80, height: 40, settings: settings)
-        try require(size.width == 80 && size.height == 40, "\(mode) enlarged an image")
+        try require(size.width == width && size.height == height, "\(mode) failed to enlarge proportionally")
     }
     var settings = ResizeSettings()
     settings.width = 2
     let narrow = try ResizeEngine.targetSize(width: 3, height: 10000, settings: settings)
     try require(narrow.width == 1 && narrow.height == 2, "Extreme aspect ratio produced an invalid size")
+}
+
+test("Every enlargement mode writes proportional pixels without replacing sources or existing outputs") {
+    let input = try fixture("upscale-modes/image.png")
+    let original = try Data(contentsOf: input)
+    let folder = input.deletingLastPathComponent()
+    let occupied = folder.appendingPathComponent("image-2.png")
+    let sentinel = Data("An existing output must not be replaced".utf8)
+    try sentinel.write(to: occupied)
+    let cases: [(ResizeMode, Int, Int)] = [(.longestEdge, 200, 100), (.fit, 200, 100),
+        (.width, 200, 100), (.height, 240, 120), (.percent, 120, 60)]
+    let expected: [[UInt8]] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]]
+    var written = Set<URL>()
+    for (mode, width, height) in cases {
+        var settings = ResizeSettings(); settings.mode = mode; settings.width = 200; settings.height = 120
+        settings.allowUpscaling = true
+        settings.percent = 150; settings.format = .png
+        let result = try ResizeEngine.resize(ImageItem.queued(input), to: folder, settings: settings)
+        let url = try outputURL(result)
+        try require(!result.skipped && result.width == width && result.height == height &&
+                    url != input && url != occupied && written.insert(url).inserted,
+                    "\(mode) skipped enlargement or replaced another file")
+        try assertDimensions(url, width, height)
+        let actual = try pixels(url)
+        for (index, probe) in [(0.2, 0.2), (0.8, 0.2), (0.2, 0.8), (0.8, 0.8)].enumerated() {
+            try requireColor(color(actual, x: probe.0, y: probe.1), expected[index],
+                             "\(mode) enlargement changed an interior color", tolerance: 3)
+        }
+    }
+    try require(try Data(contentsOf: input) == original && Data(contentsOf: occupied) == sentinel,
+                "Enlargement changed source or occupied output bytes")
+    try require(try fileManager.contentsOfDirectory(atPath: folder.path).count == 7,
+                "Enlargement left temporary files or lost an output")
 }
 
 test("Invalid dimensions and percentages fail before encoding") {
@@ -596,18 +634,22 @@ test("Invalid dimensions and percentages fail before encoding") {
     settings.height = -2
     try requireThrows("Accepted negative height") { _ = try ResizeEngine.targetSize(width: 80, height: 40, settings: settings) }
     settings.mode = .percent
-    settings.percent = 0
-    try requireThrows("Accepted zero percent") { _ = try ResizeEngine.targetSize(width: 80, height: 40, settings: settings) }
+    for percent in [0.0, -1.0, .nan, .infinity, -.infinity] {
+        settings.percent = percent
+        try requireThrows("Accepted invalid percent \(percent)") { _ = try ResizeEngine.targetSize(width: 80, height: 40, settings: settings) }
+    }
 }
 
 test("Large pixel bounds have no arbitrary cap and remain safe near Int.max") {
     var settings = ResizeSettings()
+    settings.allowUpscaling = true
     settings.width = 1_000_000
     settings.height = 1_000_000
     for mode in [ResizeMode.longestEdge, .fit, .width, .height] {
         settings.mode = mode
-        let unchanged = try ResizeEngine.targetSize(width: 300_000, height: 250_000, settings: settings)
-        try require(unchanged.width == 300_000 && unchanged.height == 250_000,
+        let enlarged = try ResizeEngine.targetSize(width: 300_000, height: 250_000, settings: settings)
+        let expected = mode == .height ? (1_200_000, 1_000_000) : (1_000_000, 833_333)
+        try require(enlarged.width == expected.0 && enlarged.height == expected.1,
                     "\(mode) imposed an arbitrary large-image size cap")
     }
     settings.mode = .longestEdge
@@ -615,11 +657,20 @@ test("Large pixel bounds have no arbitrary cap and remain safe near Int.max") {
     try require(resized.width == 1_000_000 && resized.height == 500_000, "Large target dimensions were capped")
     settings.width = Int.max
     settings.height = Int.max
-    for mode in [ResizeMode.longestEdge, .fit, .width, .height] {
+    for mode in [ResizeMode.longestEdge, .fit, .width] {
         settings.mode = mode
         let unchanged = try ResizeEngine.targetSize(width: Int.max, height: Int.max / 2, settings: settings)
         try require(unchanged.width == Int.max && unchanged.height == Int.max / 2,
-                    "\(mode) changed dimensions when bounds were sufficiently large")
+                    "\(mode) changed dimensions when the target equalled the source")
+    }
+    settings.mode = .height
+    settings.allowUpscaling = false
+    let disabled = try ResizeEngine.targetSize(width: Int.max, height: Int.max / 2, settings: settings)
+    try require(disabled.width == Int.max && disabled.height == Int.max / 2,
+                "Disabled enlargement overflowed instead of leaving a smaller image alone")
+    settings.allowUpscaling = true
+    try requireThrows("An unrepresentable enlarged width overflowed instead of failing") {
+        _ = try ResizeEngine.targetSize(width: Int.max, height: Int.max / 2, settings: settings)
     }
     settings.mode = .longestEdge
     for bound in [Int.max - 1, Int.max - 4096] {
@@ -854,7 +905,7 @@ test("Duplicate basenames and same-folder output never overwrite files") {
     try assertDimensions(sameFolder, 40, 20)
 }
 
-test("Already-fitting original images skip without writing output") {
+test("Default smaller original-format images skip without writing output") {
     let url = try fixture("already-small.png")
     let originalBytes = try Data(contentsOf: url)
     var settings = ResizeSettings()
@@ -864,7 +915,7 @@ test("Already-fitting original images skip without writing output") {
     try require(try Data(contentsOf: url) == originalBytes, "Original source bytes changed")
 }
 
-test("Already-fitting images skip even when metadata stripping is requested") {
+test("Default smaller images skip even when metadata stripping is requested") {
     let gps: [CFString: Any] = [kCGImagePropertyGPSLatitude: 42.5, kCGImagePropertyGPSLatitudeRef: "N"]
     let url = try fixture("small-gps.jpg", type: "public.jpeg",
                           properties: [kCGImagePropertyGPSDictionary: gps])
@@ -875,22 +926,24 @@ test("Already-fitting images skip even when metadata stripping is requested") {
     try require(try properties(url)[kCGImagePropertyGPSDictionary] != nil, "Skip changed original GPS metadata")
 }
 
-test("Every fitting mode, format, watermark and metadata choice skips without mutations") {
+test("Default smaller and enabled equal-size targets skip across all formats, watermarks and metadata choices") {
     let input = try fixture("skip-settings.png")
     let sourceChecksum = SHA256.hash(data: try Data(contentsOf: input))
     let folder = work.appendingPathComponent("skip-settings-output", isDirectory: true)
     try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
     try Data("Existing output must remain unchanged".utf8).write(to: folder.appendingPathComponent("existing.txt"))
     let before = try directorySnapshot(folder)
-    for mode in ResizeMode.allCases where mode != .originalDimensions {
+    for allowUpscaling in [false, true] {
+      for mode in ResizeMode.allCases where mode != .originalDimensions {
         for format in OutputFormat.allCases {
             for watermark in [false, true] {
                 for metadata in [false, true] {
                     var settings = ResizeSettings()
                     settings.mode = mode
-                    settings.width = 1600
-                    settings.height = 1600
-                    settings.percent = 100
+                    settings.allowUpscaling = allowUpscaling
+                    settings.width = allowUpscaling ? 80 : 1600
+                    settings.height = allowUpscaling ? 40 : 1600
+                    settings.percent = allowUpscaling ? 100 : 150
                     settings.format = format
                     settings.watermarkEnabled = watermark
                     settings.watermarkText = "SAMPLE"
@@ -900,6 +953,7 @@ test("Every fitting mode, format, watermark and metadata choice skips without mu
                 }
             }
         }
+      }
     }
     try require(try directorySnapshot(folder) == before, "Skip settings wrote, removed or changed output files")
     try require(try SHA256.hash(data: Data(contentsOf: input)) == sourceChecksum, "Skip settings changed source checksum")
@@ -916,41 +970,57 @@ test("Equal bounds, 100 percent and rounding to unchanged dimensions all skip") 
         settings.height = 40
         choices.append(settings)
     }
-    for percent in [100.0, 99.9] {
+    for percent in [100.0, 99.9, 100.1] {
         var settings = ResizeSettings()
         settings.mode = .percent
         settings.percent = percent
         choices.append(settings)
     }
     for var settings in choices {
+      for allowUpscaling in [false, true] {
+        settings.allowUpscaling = allowUpscaling
         settings.watermarkEnabled = true
         settings.watermarkText = "SAMPLE"
         settings.format = .jpeg
         settings.preserveMetadata = false
         try requireSkipped(ResizeEngine.resize(ResizeEngine.inspect(input), to: output, settings: settings), width: 80, height: 40)
+      }
     }
     try require(Set(try fileManager.contentsOfDirectory(atPath: output.path)) == before, "Equality skip wrote output files")
 }
 
-test("Mixed batches write only images needing reduction") {
+test("Mixed batches enlarge small images, skip equal dimensions, and reduce large images") {
     let small = try fixture("batch-skip/small.png")
+    let equal = try fixture("batch-skip/equal.png", image: bitmap(width: 300, height: 150))
     let large = try fixture("batch-skip/large.png", image: bitmap(width: 600, height: 300))
-    let checksum = SHA256.hash(data: try Data(contentsOf: small))
-    let folder = work.appendingPathComponent("mixed-batch-output", isDirectory: true)
-    try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+    let inputs = [small, equal, large]
+    let checksums = try inputs.map { SHA256.hash(data: try Data(contentsOf: $0)) }
     var settings = ResizeSettings()
     settings.width = 300
     settings.format = .png
     settings.watermarkEnabled = true
     settings.watermarkText = "SAMPLE"
     settings.preserveMetadata = false
-    let results = try [small, large].map { try ResizeEngine.resize(ResizeEngine.inspect($0), to: folder, settings: settings) }
-    try requireSkipped(results[0], width: 80, height: 40)
-    let resized = try outputURL(results[1])
-    try require(!results[1].skipped, "Large image was incorrectly skipped")
-    try assertDimensions(resized, 300, 150)
-    try require(try fileManager.contentsOfDirectory(atPath: folder.path).count == 1, "Mixed batch wrote a fitting image")
-    try require(try SHA256.hash(data: Data(contentsOf: small)) == checksum, "Mixed batch changed fitting source")
+    for allowUpscaling in [false, true] {
+        settings.allowUpscaling = allowUpscaling
+        let folder = work.appendingPathComponent("mixed-batch-output-\(allowUpscaling)", isDirectory: true)
+        try fileManager.createDirectory(at: folder, withIntermediateDirectories: true)
+        let results = try inputs.map { try ResizeEngine.resize(ResizeEngine.inspect($0), to: folder, settings: settings) }
+        try requireSkipped(results[1], width: 300, height: 150)
+        if allowUpscaling {
+            try require(!results[0].skipped, "Enabled mixed batch skipped a small image")
+            try assertDimensions(outputURL(results[0]), 300, 150)
+        } else {
+            try requireSkipped(results[0], width: 80, height: 40)
+        }
+        try require(!results[2].skipped, "Mixed batch skipped its reduction")
+        try assertDimensions(outputURL(results[2]), 300, 150)
+        try require(try fileManager.contentsOfDirectory(atPath: folder.path).count == (allowUpscaling ? 2 : 1),
+                    "Mixed batch wrote the wrong number of files for its enlargement choice")
+    }
+    for (input, checksum) in zip(inputs, checksums) {
+        try require(try SHA256.hash(data: Data(contentsOf: input)) == checksum, "Mixed batch changed a source")
+    }
 }
 
 test("Oriented fit reduces when only one displayed dimension exceeds its bound") {
@@ -982,7 +1052,7 @@ test("Corrupted, animated and multipage images are rejected") {
     try requireThrows("Accepted multipage TIFF and would silently discard pages") { _ = try ResizeEngine.inspect(multipage) }
 }
 
-test("Already-fitting images skip with disabled watermark") {
+test("Default smaller images skip with disabled watermark") {
     let input = try fixture("watermark-disabled.png")
     let original = try Data(contentsOf: input)
     var settings = ResizeSettings()
@@ -1053,7 +1123,7 @@ test("Watermark strength increases visible contrast on white, black and colored 
     }
 }
 
-test("Enabled watermark rejects invalid strength; disabled fitting images skip") {
+test("Enabled watermark rejects invalid strength; disabled smaller images skip") {
     let input = try fixture("watermark-invalid-strength.png")
     let original = try Data(contentsOf: input)
     let before = Set(try fileManager.contentsOfDirectory(atPath: output.path))
@@ -1304,7 +1374,7 @@ test("Layered PSD and TIFF exports use the visible composite and contain no edit
     }
 }
 
-test("Layered 16-bit PSD and TIFF retain composite precision and alpha after flattening") {
+test("Layered16-bit PSD and TIFF retain precision and alpha after reduction and enlargement") {
     let documents = try LayerFixtures.create(in: work.appendingPathComponent("layered-depth"))
     try require(LayerFixtures.psdLayerCount(try Data(contentsOf: documents.psd16)) == -3,
                 "16-bit PSD fixture lacks its real Lr16 layers")
@@ -1317,14 +1387,16 @@ test("Layered 16-bit PSD and TIFF retain composite precision and alpha after fla
       let originalProfile = try properties(input)[kCGImagePropertyProfileName] as? String
       let original = try Data(contentsOf: input)
       for format in [OutputFormat.png, .tiff] {
+       for targetWidth in [40, 160] {
         var settings = ResizeSettings()
-        settings.width = 40
+        settings.width = targetWidth
+        settings.allowUpscaling = true
         settings.format = format
         let url = try outputURL(ResizeEngine.resize(item, to: output, settings: settings))
         guard let image = CGImageSourceCreateImageAtIndex(try source(url), 0, nil) else {
             throw TestFailure("Cannot decode flattened 16-bit image")
         }
-        try require(image.width == 40 && image.height == 24 && image.bitsPerComponent == 16,
+        try require(image.width == targetWidth && image.height == targetWidth * 3 / 5 && image.bitsPerComponent == 16,
                     "Flattening lost 16-bit channel depth or changed dimensions")
         var words = [UInt16](repeating: 0, count: image.width * image.height * 4)
         try words.withUnsafeMutableBytes { buffer in
@@ -1348,6 +1420,7 @@ test("Layered 16-bit PSD and TIFF retain composite precision and alpha after fla
         try require(!LayerFixtures.tiffTags(encoded).contains(37724), "16-bit export retained TIFF layers")
         try require(try properties(url)[kCGImagePropertyProfileName] as? String == originalProfile && originalProfile != nil,
                     "16-bit flattened export lost ICC profile")
+       }
       }
       try require(try Data(contentsOf: input) == original, "Flattening changed layered 16-bit source")
     }
@@ -1460,7 +1533,7 @@ test("Grayscale and CMYK PSD composites match independent native color controls"
     }
 }
 
-test("Already-fitting layered inputs skip and preserve their editable layers") {
+test("Equal-size layered inputs skip and preserve their editable layers") {
     let documents = try LayerFixtures.create(in: work.appendingPathComponent("layered-skip"))
     let beforeOutput = try directorySnapshot(output)
     for input in [documents.psd, documents.psd16, documents.tiff, documents.tiff16] {
@@ -1503,13 +1576,17 @@ test("PSD without a trustworthy merged composite returns a clear compatibility e
     try require(try directorySnapshot(output) == beforeOutput, "Rejected PSD produced output files")
 }
 
-test("Crop planning applies every resize mode to the crop before reduction") {
+test("Crop planning applies every resize mode to the crop before reduction or enlargement") {
     var settings = ResizeSettings()
+    settings.allowUpscaling = true
     settings.crop = CropSelection(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
     let cases: [(ResizeMode, Int, Int, Double, Int, Int)] = [
         (.longestEdge, 1000, 600, 50, 1000, 500), (.fit, 900, 600, 50, 900, 450),
         (.width, 900, 600, 50, 900, 450), (.height, 900, 200, 50, 400, 200),
-        (.percent, 900, 600, 50, 1000, 500)
+        (.percent, 900, 600, 50, 1000, 500),
+        (.longestEdge, 3000, 2000, 150, 3000, 1500), (.fit, 3000, 2000, 150, 3000, 1500),
+        (.width, 3000, 2000, 150, 3000, 1500), (.height, 3000, 2000, 150, 4000, 2000),
+        (.percent, 3000, 2000, 150, 3000, 1500)
     ]
     for (mode, width, height, percent, expectedWidth, expectedHeight) in cases {
         settings.mode = mode; settings.width = width; settings.height = height; settings.percent = percent
@@ -1587,7 +1664,7 @@ test("Crop settings reject invalid bounds and safely restore a Codable selection
     try require(try directorySnapshot(output) == before, "Invalid crop left output files")
 }
 
-test("Asymmetric crops use displayed top-left coordinates for every EXIF orientation") {
+test("Asymmetric crops use displayed top-left coordinates for every EXIF orientation when reducing and enlarging") {
     let expected = [[0, 1, 2, 3], [1, 0, 3, 2], [3, 2, 1, 0], [2, 3, 0, 1],
                     [0, 2, 1, 3], [2, 0, 3, 1], [3, 1, 2, 0], [1, 3, 0, 2]]
     let palette: [[UInt8]] = [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 0, 255]]
@@ -1597,38 +1674,47 @@ test("Asymmetric crops use displayed top-left coordinates for every EXIF orienta
                                 properties: [kCGImagePropertyOrientation: orientation])
         let original = try Data(contentsOf: input)
         let rotated = orientation >= 5
-        var settings = ResizeSettings(); settings.format = .png; settings.width = rotated ? 84 : 78
-        settings.crop = CropSelection(x: 0.2, y: 0.15, width: 0.65, height: 0.7)
-        let url = try outputURL(ResizeEngine.resize(ResizeEngine.inspect(input), to: output, settings: settings))
-        try assertDimensions(url, rotated ? 39 : 78, rotated ? 84 : 42)
-        let rgba = try pixels(url)
-        for (index, probe) in probes.enumerated() {
-            try requireColor(color(rgba, x: probe.0, y: probe.1), palette[expected[orientation - 1][index]],
-                             "Crop picked the wrong displayed quadrant for EXIF\(orientation)", tolerance: 3)
+        let targets = [(rotated ? 84 : 78, rotated ? 39 : 78, rotated ? 84 : 42),
+                       (rotated ? 336 : 312, rotated ? 156 : 312, rotated ? 336 : 168)]
+        for (edge, width, height) in targets {
+            var settings = ResizeSettings(); settings.format = .png; settings.width = edge
+            settings.allowUpscaling = true
+            settings.crop = CropSelection(x: 0.2, y: 0.15, width: 0.65, height: 0.7)
+            let url = try outputURL(ResizeEngine.resize(ResizeEngine.inspect(input), to: output, settings: settings))
+            try assertDimensions(url, width, height)
+            let rgba = try pixels(url)
+            for (index, probe) in probes.enumerated() {
+                try requireColor(color(rgba, x: probe.0, y: probe.1), palette[expected[orientation - 1][index]],
+                                 "Crop picked the wrong displayed quadrant for EXIF\(orientation) at edge\(edge)", tolerance: 3)
+            }
+            let outputOrientation = (try properties(url)[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+            try require(outputOrientation == 1, "Cropped output retained EXIF rotation")
         }
-        let outputOrientation = (try properties(url)[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
-        try require(outputOrientation == 1, "Cropped output retained EXIF rotation")
         try require(try Data(contentsOf: input) == original, "Crop changed the oriented source file")
     }
 }
 
-test("Already-fitting crops skip without enlargement, output, or source changes") {
+test("Default smaller crops and enabled equal-size crops skip without output or source changes") {
     let input = try fixture("crop-skip.png")
     let original = try Data(contentsOf: input)
     let before = try directorySnapshot(output)
-    var settings = ResizeSettings(); settings.width = 100; settings.format = .png; settings.preserveMetadata = false
+    var settings = ResizeSettings(); settings.format = .png; settings.preserveMetadata = false
     settings.watermarkEnabled = true; settings.watermarkText = "SAMPLE"
     settings.crop = CropSelection(x: 0.25, y: 0.25, width: 0.5, height: 0.5)
-    let plan = try ResizeEngine.outputPlan(width: 80, height: 40, settings: settings)
-    try require(plan.isCropped && plan.skipped && plan.width == 40 && plan.height == 20, "Crop bypassed the existing skip/no-upscale rule")
-    try requireSkipped(ResizeEngine.resize(ResizeEngine.inspect(input), to: output, settings: settings), width: 40, height: 20)
-    settings.mode = .percent
-    for percent in [100.0, 150.0] {
-        settings.percent = percent
+    for allowUpscaling in [false, true] {
+        settings.allowUpscaling = allowUpscaling
+        settings.mode = .longestEdge; settings.width = allowUpscaling ? 40 : 100
+        let plan = try ResizeEngine.outputPlan(width: 80, height: 40, settings: settings)
+        try require(plan.isCropped && plan.skipped && plan.width == 40 && plan.height == 20, "Unchanged crop bypassed the skip rule")
         try requireSkipped(ResizeEngine.resize(ResizeEngine.inspect(input), to: output, settings: settings), width: 40, height: 20)
+        settings.mode = .percent
+        for percent in allowUpscaling ? [100.0, 99.9, 100.1] : [100.0, 150.0] {
+            settings.percent = percent
+            try requireSkipped(ResizeEngine.resize(ResizeEngine.inspect(input), to: output, settings: settings), width: 40, height: 20)
+        }
     }
     try require(try directorySnapshot(output) == before && Data(contentsOf: input) == original,
-                "Fitting crop created files or altered its source")
+                "Equal-size crop created files or altered its source")
 }
 
 test("Cropping retains alpha and ICC while honoring metadata selection") {
@@ -2353,7 +2439,7 @@ test("Web auto-extension output protects existing files and duplicate source bas
     try require(try Data(contentsOf: second) == secondBytes, "Web changed a source from another folder")
 }
 
-test("Output estimates match actual bytes across all formats, crop, watermark and metadata choices") {
+test("Enlargement estimates match actual bytes across all formats, crop, watermark and metadata choices") {
     let width = 320, height = 200
     var words = [UInt16](repeating: 0, count: width * height * 4)
     for y in 0..<height { for x in 0..<width {
@@ -2378,7 +2464,8 @@ test("Output estimates match actual bytes across all formats, crop, watermark an
     let before = try directorySnapshot(temporary)
     for format in OutputFormat.allCases {
         for preserve in [false, true] {
-            var settings = ResizeSettings(); settings.width = 128; settings.format = format; settings.preserveMetadata = preserve
+            var settings = ResizeSettings(); settings.width = 384; settings.format = format; settings.preserveMetadata = preserve
+            settings.allowUpscaling = true
             settings.crop = CropSelection(x: 0.1, y: 0.15, width: 0.8, height: 0.7)
             settings.watermarkEnabled = true; settings.watermarkText = "SAMPLE"; settings.watermarkStrength = 0.4
             var callbacks = [ImageItem]()
@@ -2388,7 +2475,7 @@ test("Output estimates match actual bytes across all formats, crop, watermark an
             try require(try directorySnapshot(temporary) == before, "Estimate left temporary files or removed caller-owned files")
             let actual = try ResizeEngine.resize(item, to: output, settings: settings)
             let url = try outputURL(actual)
-            try require(!estimate.skipped && estimate.width == 128 && estimate.height == 70 &&
+            try require(!estimate.skipped && estimate.width == 384 && estimate.height == 210 &&
                         estimate.width == actual.width && estimate.height == actual.height && estimate.outputBytes == actual.outputBytes,
                         "\(format) estimate did not match exact cropped/watermarked output bytes: estimated\(estimate.outputBytes), actual\(actual.outputBytes)")
             try require(estimate.formatExtension == url.pathExtension && estimate.outputBytes == Int64(try Data(contentsOf: url).count),
@@ -2419,24 +2506,29 @@ test("Original dimensions estimates include web auto-selection and transparent P
     }
 }
 
-test("Fitting reduction and crop estimates report zero bytes without a destination format") {
+test("Default smaller and enabled equal-size crop estimates report zero bytes without a destination format") {
     let input = try fixture("estimate-skip.png")
     let original = try Data(contentsOf: input)
     let temporary = work.appendingPathComponent("estimate-skip-temp", isDirectory: true)
     try fileManager.createDirectory(at: temporary, withIntermediateDirectories: true)
     let beforeOutput = try directorySnapshot(output)
-    for mode in ResizeMode.allCases where mode != .originalDimensions {
+    for allowUpscaling in [false, true] {
+      for mode in ResizeMode.allCases where mode != .originalDimensions {
         for format in OutputFormat.allCases {
             for cropped in [false, true] {
-                var settings = ResizeSettings(); settings.mode = mode; settings.width = 1600; settings.height = 1600; settings.percent = 100
+                var settings = ResizeSettings(); settings.mode = mode; settings.allowUpscaling = allowUpscaling
+                settings.width = allowUpscaling ? (cropped ? 40 : 80) : 1600
+                settings.height = allowUpscaling ? (cropped ? 20 : 40) : 1600
+                settings.percent = allowUpscaling ? 100 : 150
                 settings.format = format; settings.watermarkEnabled = true; settings.watermarkText = "SAMPLE"; settings.preserveMetadata = false
                 settings.crop = cropped ? CropSelection(x: 0.25, y: 0.25, width: 0.5, height: 0.5) : nil
                 let estimate = try ResizeEngine.estimateOutput(ImageItem.queued(input), settings: settings, temporaryRoot: temporary)
                 try require(estimate.skipped && estimate.outputBytes == 0 && estimate.formatExtension == nil &&
                             estimate.width == (cropped ? 40 : 80) && estimate.height == (cropped ? 20 : 40),
-                            "Fitting estimate was unavailable or predicted a conversion instead of zero bytes")
+                            "Equal-size estimate was unavailable or predicted a conversion instead of zero bytes")
             }
         }
+      }
     }
     try require(try directorySnapshot(output) == beforeOutput && fileManager.contentsOfDirectory(atPath: temporary.path).isEmpty,
                 "Skipped estimates wrote files")
