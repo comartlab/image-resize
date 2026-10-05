@@ -1,0 +1,65 @@
+# Photoshop resizing research and implementation options
+
+Researched October 4, 2026, using Adobe and Apple documentation.
+
+## Photoshop behavior
+
+Resampling changes pixel dimensions by adding or removing pixel data. Photoshop's **Automatic** option chooses a method based on whether the image is enlarged or reduced. Adobe identifies **Bicubic Sharper** as suitable for reductions; regular Bicubic favors smooth tonal transitions. Nearest Neighbor is intended for hard-edged/pixel artwork, while Bilinear is a simpler, softer option. [Adobe resampling options](https://helpx.adobe.com/photoshop/desktop/crop-resize-transform/resize-adjust-resolution/resampling-options.html)
+
+Adobe describes Bicubic Sharper as bicubic interpolation with enhanced sharpening and recommends regular Bicubic when it oversharpens. [Adobe's Image Size documentation](https://helpx.adobe.com/photoshop/using/resizing-image.pdf)
+
+These documents do not provide the exact interpolation kernel, sharpening parameters, edge treatment, or numerical implementation. Reproducing the documented workflow is feasible; matching Photoshop output pixel-for-pixel would need a controlled comparison against a specified Photoshop version and a representative corpus. No such resampling comparison has been performed.
+
+## Three native implementation approaches
+
+| Approach | Implementation | Advantages | Tradeoffs |
+| --- | --- | --- | --- |
+| Bicubic plus controlled sharpening | Implement separable cubic filtering in Swift/C or a Metal kernel. Widen the filter footprint when shrinking, then apply bounded, scale-dependent unsharp masking. | Closest to Adobe's documented reduction approach; tunable smoothing and sharpening. | More custom code and image-quality calibration. The cubic kernel and sharpening choices would be our own; halos and aliasing need careful evaluation. |
+| Accelerate/vImage Lanczos-5 | Decode/color-manage with ImageIO/CoreGraphics, then call `vImageScale_ARGB8888` for 8-bit images or `vImageScale_ARGBFFFF` for higher-depth images, with `kvImageHighQualityResampling`. | Native CPU-vector acceleration, mature scaling implementation, useful detail preservation, works across Intel and Apple silicon. | Float processing for higher-depth images uses more memory; some hard edges can exhibit ringing. |
+| Core Image Lanczos | Use `CILanczosScaleTransform` with a reused Metal-backed `CIContext`; render to the target dimensions and encode with ImageIO. | Native GPU pipeline; useful when combining resize with other image filters or many GPU operations. | GPU allocation/readback and startup costs need benchmarking; CPU fallback and consistent color/alpha handling still need validation. |
+
+Apple documents Lanczos-3 as vImage's default and Lanczos-5 when the high-quality flag is enabled. It describes vImage as optimized for the CPU's vector processor. [Resampling flag](https://developer.apple.com/documentation/accelerate/kvimagehighqualityresampling), [vImage overview](https://developer.apple.com/documentation/accelerate/vimage-library)
+
+Core Image exposes scale and aspect-ratio factors for its Lanczos filter. [CILanczosScaleTransform](https://developer.apple.com/documentation/coreimage/cilanczosscaletransform), [Core Image filter reference](https://developer-mdn.apple.com/library/archive/documentation/GraphicsImaging/Reference/CoreImageFilterReference/index.html)
+
+The relative performance tradeoffs in the table are engineering judgments; they were not benchmarked against Photoshop or across physical Intel/Apple-silicon devices. Apple also documents Lanczos ringing near high-frequency line art and demonstrates custom filters as an alternative. [Custom resampling filters](https://developer.apple.com/documentation/accelerate/reducing-artifacts-with-custom-resampling-filters)
+
+## Selected implementation
+
+This release uses **Accelerate Lanczos-5 for every reduction**. A reduction-only application can choose a high-quality downsampling method without exposing enlargement options or an algorithm dropdown. It does not classify photo versus pixel art; no universal algorithm can be proved best for every image. Nearest-neighbor pixel-art mode could be a later optional feature, but is intentionally absent from this compact automatic workflow.
+
+The engine decodes the full source, respects its RGB profile, normalizes all EXIF orientations, and filters premultiplied pixels to protect translucent edges. Version 1.2 uses native 8-bit buffers for ordinary 8-bit images and float buffers for higher-depth sources, releases the full-size working buffer after scaling, and imposes no image-dimension or memory-budget cap. It does not apply a second sharpening pass: Lanczos already preserves edge detail, and an additional uncalibrated pass could introduce halos. This policy is our implementation choice, not a claim about Adobe's internal algorithm.
+
+Small images are never enlarged. In reduction modes, images whose target dimensions equal their source dimensions are skipped without output, regardless of format, metadata, or watermark settings. Version 1.9 adds an explicit Keep original dimensions mode that exports without resampling and bypasses this skip rule while applying format, metadata, watermark, and crop settings. If a crop is set, its pixels are exported at their original scale. PNG/TIFF preserve 16-bit sources; JPEG/HEIC use 8-bit output. Source and destination paths are protected with collision-safe publication. Folder inputs are enumerated once before processing so newly produced files cannot recursively enter the same batch. Version 1.7 queues direct file drops without image inspection and publishes folder paths incrementally. Resize is available immediately; a start requested during folder listing automatically waits only for the complete path snapshot. Visible-row previews use a separate utility worker, header metadata, embedded thumbnails and cancellable native Quick Look fallback. Their availability or failure never determines whether a file can be processed, and export suspends preview work.
+
+## Batch cropping
+
+Version 1.8 adds a crop in normalized coordinates measured from the top-left of the upright image. The same relative region applies across the batch. A fixed aspect ratio is inscribed and centered in that region for each source, preserving the preset across mixed landscape/portrait inputs. Pixel rounding stays inside the image. The engine draws the oriented, flattened source into a crop-sized working buffer before Lanczos resampling, then applies the watermark to the final output. Target bounds and fitting-file skips use the cropped dimensions. The editor retains a draft until Apply to Batch; its Undo/Redo and Reset controls do not alter source files.
+
+## Layered input documents
+
+Adobe separates PSD layer records from the final merged image data. Its Version Info resource (1057) includes `hasRealMergedData`, which identifies whether the file has a real saved composite. Photoshop TIFF stores the visible composite in an image directory and editable layers in private ImageSourceData tag 37724. [Adobe file format specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)
+
+Version 1.5 reads the saved composite with ImageIO, draws it into the engine's working pixel buffer, and only then resamples it. It does not implement a separate renderer for Photoshop blending modes, masks, or effects. Their final appearance comes from Photoshop's saved composite. PSDs explicitly marked as lacking a real composite are rejected with instructions to resave using Maximize Compatibility or export a flattened TIFF. Adobe documents that the compatibility option saves a composite for use outside Photoshop. [Adobe supported image formats](https://helpx.adobe.com/photoshop/desktop/save-and-export/export-files-to-different-formats/image-file-formats-supported-in-photoshop.html)
+
+Tests use real PSD layer records and Photoshop TIFF layer payloads, with an invisible magenta layer, a green layer at 50% opacity, and a partially transparent red base. Photoshop 2026 independently opens these as layered documents with the expected appearance. Its own saved PSD copies provide an additional native-decoder check. The export pipeline drops Photoshop layer resources and layer-specific metadata; it never copies the source layer stack into the output.
+
+On macOS 15.6.1, ImageIO's 8-bit RGB PSD decoder labels premultiplied provider pixels as straight alpha; its 16-bit RGB decoder supplies actual straight alpha. The engine corrects the 8-bit RGB label and removes the white matte from the merged transparency before filtering. Gray and CMYK decode differently: already-correct premultiplied composites pass through, while straight-alpha gray/CMYK normalization happens in the native source components before conversion to sRGB. These are measured native-decoder behaviors, validated against Photoshop-saved files. The native PSD writer produces a different transparent composite, so transparent PSD reductions requested in original format fall back to PNG with an explanatory note. Opaque original-format PSD output remains a flat raster document.
+
+## Optimized for web
+
+Researched October 5, 2026. Photoshop's Save for Web lets users choose a web format, adjust compression, and inspect the resulting file size. Its Export As settings separate JPEG quality from image dimensions, offer sRGB conversion and profile embedding, and limit optional metadata to copyright/contact information. These are distinct decisions: a web export need not change the requested pixel dimensions. [Adobe Save for Web](https://helpx.adobe.com/photoshop/desktop/save-and-export/save-files/save-for-web.html), [Adobe export settings](https://helpx.adobe.com/photoshop/desktop/save-and-export/export-files-to-different-formats/export-settings-and-export-location-preferences.html)
+
+Adobe also documents optimized and progressive JPEG choices. Progressive JPEG transmits successively refined scans; it is not a guarantee of the smallest file. Photoshop additionally supports lossy/lossless WebP through Save a Copy. [Adobe graphics formats](https://helpx.adobe.com/ca/photoshop/using/saving-files-graphics-formats.html), [Adobe WebP support](https://helpx.adobe.com/photoshop/desktop/save-and-export/save-files/save-and-open-webp-files-in-photoshop.html)
+
+Version 1.10 implements a native JPEG/PNG web preset. It uses the existing output-size and crop plan unchanged, normalizes orientation, flattens layers, resizes once if required, and applies watermarking. Final pixels are converted to 8-bit sRGB after source-space Photoshop matte correction. The system sRGB profile is retained for consistent display; source EXIF, GPS, XMP, layer resources, and thumbnails are omitted. Web JPEG quality defaults to 75% on Apple's encoder and has its own saved preference. This is an application default, not an equivalence to Photoshop's quality scale.
+
+The app preserves actual output transparency in PNG. For opaque output it encodes lossless PNG, baseline JPEG, and progressive JPEG from the same rendered pixels and keeps the smallest file. Candidates are compared on disk; neither the quality setting nor pixel dimensions are silently reduced to hit a byte target. This avoids choosing a larger JPEG for flat graphics and avoids assuming progressive is always smaller. All candidates use native ImageIO, with no external runtime or network service. The macOS SDK exposes a public progressive JPEG property but no separate public Huffman-optimization switch, so identical Adobe encoding or file sizes are not claimed. File size still depends on content; a large transparent photograph may need a large PNG, and an already heavily compressed input is not guaranteed to shrink.
+
+The encoder uses Apple's documented [compression-quality property](https://developer.apple.com/documentation/imageio/kcgimagedestinationlossycompressionquality) and [progressive-JPEG property](https://developer.apple.com/documentation/imageio/kcgimagepropertyjfifisprogressive). PNG enables native adaptive scanline filtering. The explicit JPEG, PNG, TIFF, HEIC, and original-format modes retain their prior behavior and quality/metadata preferences.
+
+## Packaging
+
+The executable is compiled once for arm64 and once for x86_64 and merged with `lipo`. The DMG contains that universal application and a link to Applications. [Apple universal-binary documentation](https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary)
+
+Ad hoc signing validates the local bundle's integrity but does not identify a registered developer. The current installer is not notarized. Developer ID signing and Apple notarization require a configured certificate and credentials; the packaging script supports them when available. [Apple distribution documentation](https://developer.apple.com/documentation/xcode/distributing-your-app-for-beta-testing-and-releases), [Apple notarization documentation](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)

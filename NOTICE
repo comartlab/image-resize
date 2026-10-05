@@ -1,0 +1,33 @@
+Image Resize
+Copyright (c) 2026 The Commercial Art Lab
+https://comartlab.com
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program. If not, see https://www.gnu.org/licenses/.
+
+This grant covers the application source, original icon artwork,
+tests, build scripts, and documentation, except where otherwise noted.
+The license document itself retains the Free Software Foundation's
+copyright and verbatim-copying terms. Apple's system frameworks and
+developer tools are not part of this source distribution.
+
+The matching source archive and full license are included in the app
+bundle and installer. Distributed modified versions must provide
+corresponding source under the GPL, retain applicable notices, and
+identify their changes and a relevant date. Private modifications need not
+be published.
+
+This software license does not change the ownership or license of
+images supplied to or produced by the application.
