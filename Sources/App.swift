@@ -257,7 +257,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             credits.append(NSAttributedString(string: text, attributes: attributes))
         }
         append("comartlab.com", link: URL(string: "https://comartlab.com"))
-        append("\n\nGNU GPL v3 or later\nRedistribution permitted. Distributed modifications must remain open source under the GPL.\nProvided without warranty.\n\n")
+        append("\nGNU GPL v3 or later\nRedistribution permitted. Distributed modifications must include GPL source.\nNo warranty.\n")
         if let license = Bundle.main.url(forResource: "LICENSE", withExtension: "txt") {
             append("View License", link: license)
         }
