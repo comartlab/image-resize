@@ -16,7 +16,7 @@ mkdir -p "$BUILD/module-cache/crop-editor-$TEST_ARCH"
 xcrun swiftc -O -target "$TEST_ARCH-apple-macosx12.0" \
   -module-cache-path "$BUILD/module-cache/crop-editor-$TEST_ARCH" \
   "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/CropEditor.swift" \
-  "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" \
+  "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" "$ROOT/Sources/PNGWatermark.swift" \
   "$ROOT/Tests/CropEditorChecks.swift" \
   -framework AppKit -framework Accelerate -framework ImageIO -framework CoreText \
   -framework UniformTypeIdentifiers -o "$TEST_BINARY"

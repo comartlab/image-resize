@@ -36,6 +36,10 @@ Version 1.13 adds an Allow upscaling checkbox, off by default and remembered bet
 
 Version 1.8 adds a crop in normalized coordinates measured from the top-left of the upright image. The same relative region applies across the batch. A fixed aspect ratio is inscribed and centered in that region for each source, preserving the preset across mixed landscape/portrait inputs. Pixel rounding stays inside the image. The engine draws the oriented, flattened source into a crop-sized working buffer before Lanczos resampling, then applies the watermark to the final output. Target bounds and unchanged-dimension skips use the cropped dimensions. The editor retains a draft until Apply to Batch; its Undo/Redo and Reset controls do not alter source files.
 
+## PNG watermarks
+
+Version 1.14 adds PNG logos alongside text watermarks. The logo is decoded once in the background and shared by previews, estimates and batch exports. Its longest edge is a user-selected percentage of the final output's shorter edge; padding is measured from both selected corner edges using the same reference. The logo keeps its proportions and fits inside that inset, including on tiny outputs. Placement follows orientation normalization, cropping and resizing. Native CoreGraphics blends the PNG's transparency and profile into the output buffer at the selected strength. All PNG controls and the selected file are remembered; a missing file must be chosen again. Text and PNG strengths are remembered separately.
+
 ## Layered input documents
 
 Adobe separates PSD layer records from the final merged image data. Its Version Info resource (1057) includes `hasRealMergedData`, which identifies whether the file has a real saved composite. Photoshop TIFF stores the visible composite in an image directory and editable layers in private ImageSourceData tag 37724. [Adobe file format specification](https://www.adobe.com/devnet-apps/photoshop/fileformatashtml/)

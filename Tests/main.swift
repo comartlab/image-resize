@@ -2729,6 +2729,127 @@ test("Produce clean product-style watermark previews") {
     print("Watermark previews: \(preview.path)")
 }
 
+test("PNG watermark loading validates actual format and active settings") {
+    let png = try fixture("logo.png", image: bitmap(width: 40, height: 20, transparent: true))
+    let image = try PNGWatermark.load(png)
+    try require(image.width == 40 && image.height == 20, "PNG logo dimensions changed")
+    let jpeg = try fixture("pretend.png", type: "public.jpeg")
+    try requireThrows("Accepted JPEG masquerading as PNG") { _ = try PNGWatermark.load(jpeg) }
+    try requireThrows("Accepted missing logo") { _ = try PNGWatermark.load(work.appendingPathComponent("missing.png")) }
+    for (size, padding, strength) in [(0.0, 0.03, 1.0), (1.01, 0.03, 1.0), (0.25, -0.1, 1.0),
+                                       (0.25, 0.5, 1.0), (.nan, 0.03, 1.0), (0.25, .infinity, 1.0), (0.25, 0.03, .nan)] {
+        try requireThrows("Accepted invalid PNG settings") {
+            try PNGWatermark.validate(image: image, size: size, padding: padding, strength: strength)
+        }
+    }
+    try requireThrows("Accepted no PNG") { try PNGWatermark.validate(image: nil, size: 0.25, padding: 0.03, strength: 1) }
+}
+
+test("PNG corners retain logo orientation, alpha, scale and padding on all image shapes") {
+    let logoURL = try fixture("corner-logo.png", image: bitmap(width: 40, height: 20, transparent: true))
+    let logo = try PNGWatermark.load(logoURL)
+    let logoBytes = try Data(contentsOf: logoURL)
+    for (width, height) in [(400, 400), (600, 400), (400, 600)] {
+        let input = try fixture("corner-\(width)-\(height).png", image: solidBitmap(width: width, height: height, white: 1))
+        let original = try Data(contentsOf: input)
+        for corner in WatermarkCorner.allCases {
+            var settings = ResizeSettings(); settings.mode = .originalDimensions; settings.format = .png
+            settings.watermarkEnabled = true; settings.watermarkKind = .png; settings.watermarkImage = logo
+            settings.watermarkStrength = 1; settings.watermarkSize = 0.25; settings.watermarkPadding = 0.05
+            settings.watermarkCorner = corner
+            let result = try ResizeEngine.resize(ImageItem.queued(input), to: output, settings: settings)
+            let actual = try pixels(outputURL(result))
+            // Independent expected placement in top-left image coordinates.
+            let right = corner == .upperRight || corner == .lowerRight
+            let upper = corner == .upperLeft || corner == .upperRight
+            let left = right ? width - 120 : 20
+            let top = upper ? 20 : height - 70
+            let green = color(actual, x: Double(left + 75) / Double(width), y: Double(top + 12) / Double(height))
+            let yellow = color(actual, x: Double(left + 75) / Double(width), y: Double(top + 38) / Double(height))
+            let clear = color(actual, x: Double(left + 25) / Double(width), y: Double(top + 12) / Double(height))
+            try requireColor(green, [0, 255, 0, 255], "\(corner) logo top/orientation misplaced", tolerance: 3)
+            try requireColor(yellow, [255, 255, 0, 255], "\(corner) logo bottom/orientation misplaced", tolerance: 3)
+            try requireColor(clear, [255, 255, 255, 255], "Logo transparency did not preserve underlying pixels", tolerance: 0)
+            var changed = 0
+            for y in 0..<height { for x in 0..<width {
+                let offset = (y * width + x) * 4
+                if actual.2[offset..<offset+3].contains(where: { $0 < 250 }) {
+                    changed += 1
+                    try require(x >= left && x < left + 100 && y >= top && y < top + 50,
+                                "PNG altered pixels outside selected corner")
+                }
+            } }
+            try require(changed > 2300 && changed < 2700, "Logo size or alpha coverage is wrong")
+        }
+        try require(try Data(contentsOf: input) == original, "PNG watermark modified original")
+    }
+    try require(try Data(contentsOf: logoURL) == logoBytes, "PNG watermark modified logo file")
+}
+
+test("PNG strength blends alpha and zero strength preserves output pixels") {
+    let input = try fixture("logo-opacity-base.png", image: solidBitmap(width: 200, height: 200, white: 1))
+    let logo = try PNGWatermark.load(fixture("opacity-logo.png", image: bitmap(width: 40, height: 20, transparent: true)))
+    var settings = ResizeSettings(); settings.mode = .originalDimensions; settings.format = .png
+    settings.watermarkEnabled = true; settings.watermarkKind = .png; settings.watermarkImage = logo
+    settings.watermarkCorner = .upperLeft; settings.watermarkSize = 0.4; settings.watermarkPadding = 0.1
+    settings.watermarkStrength = 0.5
+    let half = try pixels(outputURL(ResizeEngine.resize(ImageItem.queued(input), to: output, settings: settings)))
+    try requireColor(color(half, x: 0.4, y: 0.15), [128, 255, 128, 255], "PNG opacity not blended", tolerance: 2)
+    settings.watermarkStrength = 0
+    let zero = try pixels(outputURL(ResizeEngine.resize(ImageItem.queued(input), to: output, settings: settings)))
+    try require(zero.2 == pixels(input).2, "Zero PNG strength changed pixels")
+    for corner in WatermarkCorner.allCases {
+        let rect = try PNGWatermark.frame(image: logo, width: 1, height: 7, corner: corner, size: 1, padding: 0.25)
+        try require(rect.minX >= 0.25 && rect.maxX <= 0.75 && rect.minY >= 0.25 && rect.maxY <= 6.75,
+                    "Tiny padded logo escaped image bounds")
+    }
+}
+
+test("PNG placement uses oriented cropped resized output and estimates match every format") {
+    let logo = try PNGWatermark.load(fixture("format-logo.png", image: bitmap(width: 40, height: 20, transparent: true)))
+    let input = try fixture("logo-crop-source.tiff", type: "public.tiff", image: solidBitmap(width: 600, height: 400, white: 1, p3: true),
+                            properties: [kCGImagePropertyOrientation: 6])
+    for format in OutputFormat.allCases {
+        var settings = ResizeSettings(); settings.width = 300; settings.format = format
+        settings.crop = CropSelection(x: 0.1, y: 0.1, width: 0.8, height: 0.5)
+        settings.watermarkEnabled = true; settings.watermarkKind = .png; settings.watermarkImage = logo
+        settings.watermarkCorner = .lowerRight; settings.watermarkStrength = 1
+        settings.watermarkSize = 0.4; settings.watermarkPadding = 0.05
+        let estimate = try ResizeEngine.estimateOutput(ImageItem.queued(input), settings: settings)
+        let result = try ResizeEngine.resize(ImageItem.queued(input), to: output, settings: settings)
+        let actual = try pixels(outputURL(result))
+        try require(result.width == 300 && result.height == 281 && estimate.outputBytes == result.outputBytes,
+                    "PNG crop/format estimate changed requested output dimensions or bytes")
+        let rect = try PNGWatermark.frame(image: logo, width: actual.0, height: actual.1,
+                                         corner: .lowerRight, size: 0.4, padding: 0.05)
+        let x = (rect.minX + rect.width * 0.75) / CGFloat(actual.0)
+        let y = (CGFloat(actual.1) - rect.maxY + rect.height * 0.25) / CGFloat(actual.1)
+        try requireColor(color(actual, x: Double(x), y: Double(y)), [0, 255, 0, 255], "PNG missing on \(format)", tolerance: 30)
+        try requireColor(color(actual, x: 0.05, y: 0.05), [255,255,255,255], "PNG disturbed opposite corner", tolerance: 3)
+    }
+}
+
+test("PNG logos render on high-depth layered composites and transparent web outputs") {
+    let documents = try LayerFixtures.create(in: work.appendingPathComponent("png-logo-layered"))
+    let logo = try PNGWatermark.load(fixture("high-depth-logo.png", image: bitmap(width: 40, height: 20, transparent: true)))
+    for input in [documents.psd16, documents.tiff16] {
+        for format in [OutputFormat.png, .web] {
+            var settings = ResizeSettings(); settings.mode = .originalDimensions; settings.format = format
+            let base = try pixels(outputURL(ResizeEngine.resize(ImageItem.queued(input), to: output, settings: settings)))
+            settings.watermarkEnabled = true; settings.watermarkKind = .png; settings.watermarkImage = logo
+            settings.watermarkCorner = .upperRight; settings.watermarkSize = 0.8; settings.watermarkPadding = 0.05; settings.watermarkStrength = 0.7
+            let url = try outputURL(ResizeEngine.resize(ImageItem.queued(input), to: output, settings: settings))
+            let marked = try pixels(url)
+            try require(marked.2 != base.2 && marked.2.enumerated().contains { $0.offset % 4 == 3 && $0.element < 255 },
+                        "PNG logo missing or alpha lost on high-depth layered source")
+            if format == .png {
+                let image = CGImageSourceCreateImageAtIndex(try source(url), 0, nil)!
+                try require(image.bitsPerComponent == 16, "PNG watermark reduced high-depth source precision")
+            }
+        }
+    }
+}
+
 print("\n\(passed) passed, \(failed) failed")
 if failed > 0 {
     print("Fixtures and outputs: \(work.path)")

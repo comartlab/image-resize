@@ -14,7 +14,7 @@ esac
 BENCHMARK_BINARY="$BUILD/resize-benchmark-$BENCHMARK_ARCH"
 mkdir -p "$BUILD/module-cache"
 xcrun swiftc -O -target "$BENCHMARK_ARCH-apple-macosx12.0" -module-cache-path "$BUILD/module-cache" \
-  "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" "$ROOT/Tests/Benchmark.swift" \
+  "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" "$ROOT/Sources/PNGWatermark.swift" "$ROOT/Tests/Benchmark.swift" \
   -framework AppKit -framework Accelerate -framework ImageIO -framework CoreText \
   -o "$BENCHMARK_BINARY"
 if [[ "$BENCHMARK_ARCH" == "$(uname -m)" ]]; then

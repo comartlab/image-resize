@@ -18,7 +18,7 @@ esac
 LARGE_TEST_BINARY="$BUILD/resize-large-tests-$LARGE_TEST_ARCH"
 mkdir -p "$BUILD/module-cache" "$BUILD/large-image-output"
 xcrun swiftc -O -target "$LARGE_TEST_ARCH-apple-macosx12.0" -module-cache-path "$BUILD/module-cache" \
-  "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" "$ROOT/Tests/LargeImage.swift" \
+  "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" "$ROOT/Sources/PNGWatermark.swift" "$ROOT/Tests/LargeImage.swift" \
   -framework AppKit -framework Accelerate -framework ImageIO -framework CoreText \
   -o "$LARGE_TEST_BINARY"
 if [[ "$LARGE_TEST_ARCH" == "$(uname -m)" ]]; then

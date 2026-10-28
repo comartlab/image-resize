@@ -135,6 +135,15 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var standardQuality = 90.0
     private var webQuality = 75.0
     private var standardMetadata = true
+    private var lastWatermarkKind: WatermarkKind = .text
+    private var textWatermarkStrength = 25.0
+    private var pngWatermarkStrength = 100.0
+    private var watermarkPNGURL: URL?
+    private var watermarkPNGBookmark: Data?
+    private var watermarkPNGImage: CGImage?
+    private var watermarkPNGLoading = false
+    private var watermarkPNGError: String?
+    private var watermarkPNGGeneration = 0
     private var previewPanel: NSPanel?
     private var previewSourceID: UUID?
     private var previewGeneration = 0
@@ -169,7 +178,15 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let qualityTitle = NSTextField(labelWithString: "Quality")
     private let metadata = NSButton(checkboxWithTitle: "Keep metadata", target: nil, action: nil)
     private let watermark = NSButton(checkboxWithTitle: "Watermark", target: nil, action: nil)
+    private let watermarkType = NSPopUpButton()
     private let watermarkText = NSTextField(string: "")
+    private let watermarkPNGButton = NSButton(title: "Choose PNG…", target: nil, action: nil)
+    private let watermarkPosition = NSPopUpButton()
+    private let watermarkSize = NSSlider(value: 25, minValue: 1, maxValue: 100, target: nil, action: nil)
+    private let watermarkSizeLabel = NSTextField(labelWithString: "25%")
+    private let watermarkPadding = NSSlider(value: 3, minValue: 0, maxValue: 25, target: nil, action: nil)
+    private let watermarkPaddingLabel = NSTextField(labelWithString: "3%")
+    private var watermarkPNGOptions: NSStackView!
     private let watermarkStrength = NSSlider(value: 25, minValue: 0, maxValue: 100, target: nil, action: nil)
     private let strengthTitle = NSTextField(labelWithString: "Strength")
     private let strengthLabel = NSTextField(labelWithString: "25%")
@@ -192,6 +209,11 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         result.webQuality = (result.format == .web ? quality.doubleValue : webQuality) / 100
         result.preserveMetadata = metadata.state == .on
         result.watermarkEnabled = watermark.state == .on
+        result.watermarkKind = WatermarkKind.allCases[max(0, watermarkType.indexOfSelectedItem)]
+        result.watermarkImage = watermarkPNGImage
+        result.watermarkCorner = WatermarkCorner.allCases[max(0, watermarkPosition.indexOfSelectedItem)]
+        result.watermarkSize = watermarkSize.doubleValue / 100
+        result.watermarkPadding = watermarkPadding.doubleValue / 100
         result.watermarkText = watermarkText.stringValue
         result.watermarkStrength = watermarkStrength.doubleValue / 100
         result.crop = cropSelection
@@ -279,8 +301,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         let view = NSView(); view.setContentHuggingPriority(.init(1), for: .horizontal); return view
     }
     private func createWindow() {
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 730, height: 630), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Image Resize"; window.minSize = NSSize(width: 690, height: 540); window.center()
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 730, height: 680), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window.title = "Image Resize"; window.minSize = NSSize(width: 690, height: 590); window.center()
         window.isReleasedWhenClosed = false
         window.delegate = self
         window.setFrameAutosaveName("MainWindow")
@@ -340,6 +362,15 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         metadata.toolTip = "Keep EXIF, camera, date and GPS information. Turn off to remove this information."
         let formatRow = row([NSTextField(labelWithString: "Format"), format, qualityTitle, quality, qualityLabel, flexible(), metadata])
         watermark.target = self; watermark.action = #selector(optionsChanged(_:))
+        watermarkType.addItems(withTitles: ["Text", "PNG"])
+        watermarkType.target = self; watermarkType.action = #selector(optionsChanged(_:))
+        watermarkType.setAccessibilityLabel("Watermark type")
+        watermarkType.widthAnchor.constraint(equalToConstant: 78).isActive = true
+        button(watermarkPNGButton, action: #selector(chooseWatermarkPNG(_:)))
+        watermarkPNGButton.alignment = .left; watermarkPNGButton.lineBreakMode = .byTruncatingMiddle
+        watermarkPNGButton.setAccessibilityLabel("Choose PNG watermark")
+        watermarkPNGButton.setContentHuggingPriority(.init(1), for: .horizontal)
+        watermarkPNGButton.setContentCompressionResistancePriority(.init(1), for: .horizontal)
         watermarkText.placeholderString = "Watermark text"
         watermarkText.delegate = self; watermarkText.setAccessibilityLabel("Watermark text")
         watermarkText.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -354,7 +385,26 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         previewButton.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "Preview watermark")
         previewButton.imagePosition = .imageOnly; previewButton.bezelStyle = .rounded
         previewButton.target = self; previewButton.action = #selector(showPreview(_:)); previewButton.toolTip = "Preview the watermark. Choose Crop in the preview to crop the batch."
-        let watermarkRow = row([watermark, watermarkText, strengthTitle, watermarkStrength, strengthLabel, previewButton])
+        let watermarkRow = row([watermark, watermarkType, watermarkText, watermarkPNGButton, strengthTitle, watermarkStrength, strengthLabel, previewButton])
+        watermarkPosition.addItems(withTitles: ["Upper left", "Upper right", "Lower left", "Lower right"])
+        watermarkPosition.selectItem(at: 3)
+        watermarkPosition.target = self; watermarkPosition.action = #selector(optionsChanged(_:))
+        watermarkPosition.setAccessibilityLabel("PNG watermark position")
+        watermarkPosition.widthAnchor.constraint(equalToConstant: 130).isActive = true
+        for slider in [watermarkSize, watermarkPadding] {
+            slider.target = self; slider.action = #selector(optionsChanged(_:)); slider.isContinuous = true
+            slider.widthAnchor.constraint(equalToConstant: 95).isActive = true
+        }
+        watermarkSize.setAccessibilityLabel("PNG watermark size")
+        watermarkSize.toolTip = "Logo's longest edge as a percentage of the output image's shorter edge. Proportions are preserved."
+        watermarkPadding.setAccessibilityLabel("PNG watermark padding")
+        watermarkPadding.toolTip = "Distance from both corner edges as a percentage of the output image's shorter edge."
+        for label in [watermarkSizeLabel, watermarkPaddingLabel] {
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            label.widthAnchor.constraint(equalToConstant: 35).isActive = true
+        }
+        watermarkPNGOptions = row([watermarkPosition, NSTextField(labelWithString: "Size"), watermarkSize, watermarkSizeLabel,
+                                   NSTextField(labelWithString: "Padding"), watermarkPadding, watermarkPaddingLabel, flexible()])
         button(folderButton, action: #selector(chooseFolder(_:)))
         folderButton.alignment = .left; folderButton.lineBreakMode = .byTruncatingMiddle
         folderButton.setContentHuggingPriority(.init(1), for: .horizontal)
@@ -371,7 +421,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         status.lineBreakMode = .byTruncatingMiddle; status.setContentCompressionResistancePriority(.init(1), for: .horizontal)
         let actionRow = row([status, flexible(), detailsButton, startButton])
         progress.style = .bar; progress.isIndeterminate = false; progress.minValue = 0; progress.maxValue = 1; progress.isHidden = true
-        let stack = NSStackView(views: [inputRow, drop, sizeRow, formatRow, watermarkRow, outputRow, progress, actionRow])
+        let stack = NSStackView(views: [inputRow, drop, sizeRow, formatRow, watermarkRow, watermarkPNGOptions!, outputRow, progress, actionRow])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14; stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
         NSLayoutConstraint.activate([
@@ -379,7 +429,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 18), stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -18),
             drop.heightAnchor.constraint(greaterThanOrEqualToConstant: 180)
         ])
-        [inputRow, drop, sizeRow, formatRow, watermarkRow, outputRow, progress, actionRow].forEach { $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        [inputRow, drop, sizeRow, formatRow, watermarkRow, watermarkPNGOptions!, outputRow, progress, actionRow].forEach { $0.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
         drop.setContentHuggingPriority(.init(1), for: .vertical)
     }
 
@@ -412,6 +462,30 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             let saved = prefs.double(forKey: "watermarkStrength")
             if saved.isFinite { watermarkStrength.doubleValue = min(100, max(0, saved)) }
         }
+        textWatermarkStrength = watermarkStrength.doubleValue
+        if let saved = prefs.string(forKey: "watermarkKind"), let index = WatermarkKind.allCases.firstIndex(where: { $0.rawValue == saved }) {
+            watermarkType.selectItem(at: index)
+        }
+        lastWatermarkKind = WatermarkKind.allCases[max(0, watermarkType.indexOfSelectedItem)]
+        if prefs.object(forKey: "watermarkPNGStrength") != nil {
+            let saved = prefs.double(forKey: "watermarkPNGStrength")
+            if saved.isFinite { pngWatermarkStrength = min(100, max(0, saved)) }
+        }
+        watermarkStrength.doubleValue = lastWatermarkKind == .png ? pngWatermarkStrength : textWatermarkStrength
+        if let saved = prefs.string(forKey: "watermarkCorner"), let index = WatermarkCorner.allCases.firstIndex(where: { $0.rawValue == saved }) {
+            watermarkPosition.selectItem(at: index)
+        }
+        for (key, slider) in [("watermarkSize", watermarkSize), ("watermarkPadding", watermarkPadding)] where prefs.object(forKey: key) != nil {
+            let saved = prefs.double(forKey: key)
+            if saved.isFinite { slider.doubleValue = min(slider.maxValue, max(slider.minValue, saved)) }
+        }
+        watermarkPNGBookmark = prefs.data(forKey: "watermarkPNGBookmark")
+        var pngURL = prefs.string(forKey: "watermarkPNGPath").map { URL(fileURLWithPath: $0) }
+        if let bookmark = watermarkPNGBookmark {
+            var stale = false
+            if let resolved = try? URL(resolvingBookmarkData: bookmark, options: .withoutUI, relativeTo: nil, bookmarkDataIsStale: &stale) { pngURL = resolved }
+        }
+        if let url = pngURL { loadWatermarkPNG(url) }
         if let path = prefs.string(forKey: "output") { outputFolder = URL(fileURLWithPath: path, isDirectory: true) }
         if let saved = prefs.string(forKey: "cropAspect"), let aspect = CropAspect(rawValue: saved) { cropAspect = aspect }
         if let data = prefs.data(forKey: "cropSelection"), let crop = try? JSONDecoder().decode(CropSelection.self, from: data),
@@ -432,12 +506,59 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         prefs.set(standardMetadata, forKey: "metadata")
         prefs.set(recursive.state == .on, forKey: "recursive"); prefs.set(outputFolder?.path, forKey: "output")
         prefs.set(watermark.state == .on, forKey: "watermarkEnabled"); prefs.set(watermarkText.stringValue, forKey: "watermarkText")
-        prefs.set(watermarkStrength.doubleValue, forKey: "watermarkStrength")
+        if settings.watermarkKind == .png { pngWatermarkStrength = watermarkStrength.doubleValue }
+        else { textWatermarkStrength = watermarkStrength.doubleValue }
+        prefs.set(textWatermarkStrength, forKey: "watermarkStrength")
+        prefs.set(pngWatermarkStrength, forKey: "watermarkPNGStrength")
+        prefs.set(settings.watermarkKind.rawValue, forKey: "watermarkKind")
+        prefs.set(settings.watermarkCorner.rawValue, forKey: "watermarkCorner")
+        prefs.set(watermarkSize.doubleValue, forKey: "watermarkSize")
+        prefs.set(watermarkPadding.doubleValue, forKey: "watermarkPadding")
+        prefs.set(watermarkPNGURL?.path, forKey: "watermarkPNGPath")
+        prefs.set(watermarkPNGBookmark, forKey: "watermarkPNGBookmark")
         prefs.set(cropAspect.rawValue, forKey: "cropAspect")
         if let crop = cropSelection, let data = try? JSONEncoder().encode(crop) { prefs.set(data, forKey: "cropSelection") }
         else { prefs.removeObject(forKey: "cropSelection") }
     }
+    @objc private func chooseWatermarkPNG(_ sender: Any?) {
+        guard !busy else { return }
+        let panel = NSOpenPanel(); panel.allowedContentTypes = [.png]
+        panel.canChooseDirectories = false; panel.allowsMultipleSelection = false; panel.prompt = "Choose"
+        panel.directoryURL = watermarkPNGURL?.deletingLastPathComponent()
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            self?.loadWatermarkPNG(url)
+        }
+    }
+    private func loadWatermarkPNG(_ url: URL) {
+        watermarkPNGGeneration += 1
+        let generation = watermarkPNGGeneration
+        watermarkPNGURL = url; watermarkPNGImage = nil; watermarkPNGLoading = true; watermarkPNGError = nil
+        watermarkPNGBookmark = nil
+        dismissPreview(); rowResults.removeAll(); errorIDs.removeAll(); invalidateEstimates()
+        updateOptions(); updateState(); reloadImageRows()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try PNGWatermark.load(url) }
+            let bookmark = try? url.bookmarkData(options: .minimalBookmark, includingResourceValuesForKeys: nil, relativeTo: nil)
+            DispatchQueue.main.async {
+                guard let self = self, self.watermarkPNGGeneration == generation else { return }
+                self.watermarkPNGLoading = false; self.watermarkPNGBookmark = bookmark
+                switch result {
+                case .success(let image): self.watermarkPNGImage = image
+                case .failure(let error): self.watermarkPNGError = "\(url.lastPathComponent): \(error.localizedDescription)"
+                }
+                if self.busy { self.updateOptions(); self.savePreferences() }
+                else { self.optionsChanged(nil) }
+            }
+        }
+    }
     @objc private func optionsChanged(_ sender: Any?) {
+        if sender as? NSPopUpButton === watermarkType {
+            if lastWatermarkKind == .png { pngWatermarkStrength = watermarkStrength.doubleValue }
+            else { textWatermarkStrength = watermarkStrength.doubleValue }
+            lastWatermarkKind = WatermarkKind.allCases[max(0, watermarkType.indexOfSelectedItem)]
+            watermarkStrength.doubleValue = lastWatermarkKind == .png ? pngWatermarkStrength : textWatermarkStrength
+        }
         if sender as? NSPopUpButton === format {
             if lastFormat == .web { webQuality = quality.doubleValue }
             else { standardQuality = quality.doubleValue; standardMetadata = metadata.state == .on }
@@ -453,7 +574,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             }
             lastModeIndex = mode.indexOfSelectedItem
         }
-        let refreshPreview = sender as? NSSlider === watermarkStrength && previewPanel != nil
+        let refreshPreview = previewPanel != nil && (sender as? NSSlider === watermarkStrength || sender as? NSSlider === watermarkSize || sender as? NSSlider === watermarkPadding || sender as? NSPopUpButton === watermarkPosition)
         if refreshPreview { cancelPreviewWork() } else { dismissPreview() }
         rowResults.removeAll(); errorIDs.removeAll(); invalidateEstimates()
         updateOptions(); updateState(); reloadImageRows(); savePreferences()
@@ -473,6 +594,12 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     }
     func controlTextDidEndEditing(_ obj: Notification) { savePreferences() }
     private func updateOptions() {
+        let png = settings.watermarkKind == .png
+        watermarkText.isHidden = png; watermarkPNGButton.isHidden = !png; watermarkPNGOptions.isHidden = !png
+        watermarkPNGButton.title = watermarkPNGLoading ? "Loading PNG…" : (watermarkPNGURL?.lastPathComponent ?? "Choose PNG…")
+        watermarkPNGButton.toolTip = watermarkPNGError ?? watermarkPNGURL?.path ?? "Choose a PNG, including transparent logos."
+        watermarkSizeLabel.stringValue = "\(Int(watermarkSize.doubleValue.rounded()))%"
+        watermarkPaddingLabel.stringValue = "\(Int(watermarkPadding.doubleValue.rounded()))%"
         let fit = mode.indexOfSelectedItem == 1
         let original = settings.mode == .originalDimensions
         times.isHidden = !fit; secondValue.isHidden = !fit
@@ -500,7 +627,16 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             return "Enter positive whole pixel sizes."
         }
         if current.watermarkEnabled {
-            do { try TextWatermark.validate(current.watermarkText, strength: current.watermarkStrength) }
+            do {
+                switch current.watermarkKind {
+                case .text: try TextWatermark.validate(current.watermarkText, strength: current.watermarkStrength)
+                case .png:
+                    if watermarkPNGLoading { return "Loading PNG watermark…" }
+                    if let error = watermarkPNGError { return error }
+                    try PNGWatermark.validate(image: current.watermarkImage, size: current.watermarkSize,
+                                              padding: current.watermarkPadding, strength: current.watermarkStrength)
+                }
+            }
             catch { return error.localizedDescription }
         }
         return nil
@@ -515,6 +651,14 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         resetCropButton.isEnabled = !locked && cropSelection != nil
         [mode, format].forEach { $0.isEnabled = !locked }
         [firstValue, secondValue].forEach { $0.isEnabled = !locked }
+        watermarkType.isEnabled = !locked && watermark.state == .on
+        watermarkPNGButton.isEnabled = !locked && watermark.state == .on
+        watermarkPosition.isEnabled = !locked && watermark.state == .on
+        watermarkSize.isEnabled = !locked && watermark.state == .on
+        watermarkPadding.isEnabled = !locked && watermark.state == .on
+        watermarkPNGOptions.arrangedSubviews.compactMap { $0 as? NSTextField }.forEach {
+            $0.textColor = !locked && watermark.state == .on ? .labelColor : .disabledControlTextColor
+        }
         watermarkText.isEnabled = !locked && watermark.state == .on
         watermarkStrength.isEnabled = !locked && watermark.state == .on
         strengthTitle.textColor = watermarkStrength.isEnabled ? .labelColor : .disabledControlTextColor

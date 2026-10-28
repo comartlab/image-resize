@@ -27,6 +27,11 @@ struct ResizeSettings {
     var webQuality: Double = 0.75
     var preserveMetadata: Bool = true
     var watermarkEnabled: Bool = false
+    var watermarkKind: WatermarkKind = .text
+    var watermarkImage: CGImage? = nil
+    var watermarkCorner: WatermarkCorner = .lowerRight
+    var watermarkSize: Double = 0.25
+    var watermarkPadding: Double = 0.03
     var watermarkText: String = ""
     var watermarkStrength: Double = 0.25
     var crop: CropSelection? = nil
@@ -301,7 +306,11 @@ final class ResizeEngine {
             throw ResizeError.invalidSettings("Image quality must be between 0 and 100 percent.")
         }
         if settings.watermarkEnabled {
-            try TextWatermark.validate(settings.watermarkText, strength: settings.watermarkStrength)
+            switch settings.watermarkKind {
+            case .text: try TextWatermark.validate(settings.watermarkText, strength: settings.watermarkStrength)
+            case .png: try PNGWatermark.validate(image: settings.watermarkImage, size: settings.watermarkSize,
+                                               padding: settings.watermarkPadding, strength: settings.watermarkStrength)
+            }
         }
         let watermarkIsVisible = settings.watermarkEnabled && settings.watermarkStrength > 0
         let values = try folder.resourceValues(forKeys: [.isDirectoryKey])
@@ -336,7 +345,10 @@ final class ResizeEngine {
                                       cropRect: target.cropRect, cropWidth: target.cropWidth, cropHeight: target.cropHeight,
                                       width: target.width, height: target.height,
                                       outputType: outputType.identifier,
-                                      watermarkText: watermarkIsVisible ? settings.watermarkText : nil,
+                                      watermarkText: watermarkIsVisible && settings.watermarkKind == .text ? settings.watermarkText : nil,
+                                      watermarkImage: watermarkIsVisible && settings.watermarkKind == .png ? settings.watermarkImage : nil,
+                                      watermarkCorner: settings.watermarkCorner, watermarkSize: settings.watermarkSize,
+                                      watermarkPadding: settings.watermarkPadding,
                                       watermarkStrength: settings.watermarkStrength,
                                       photoshopWhiteMatte: photoshopWhiteMatte,
                                       optimizedForWeb: optimizedForWeb,
@@ -351,7 +363,10 @@ final class ResizeEngine {
                                       cropRect: target.cropRect, cropWidth: target.cropWidth, cropHeight: target.cropHeight,
                                       width: target.width, height: target.height,
                                       outputType: outputType.identifier,
-                                      watermarkText: watermarkIsVisible ? settings.watermarkText : nil,
+                                      watermarkText: watermarkIsVisible && settings.watermarkKind == .text ? settings.watermarkText : nil,
+                                      watermarkImage: watermarkIsVisible && settings.watermarkKind == .png ? settings.watermarkImage : nil,
+                                      watermarkCorner: settings.watermarkCorner, watermarkSize: settings.watermarkSize,
+                                      watermarkPadding: settings.watermarkPadding,
                                       watermarkStrength: settings.watermarkStrength,
                                       photoshopWhiteMatte: photoshopWhiteMatte,
                                       cancelled: cancelled)
@@ -376,7 +391,10 @@ final class ResizeEngine {
                                           cropRect: target.cropRect, cropWidth: target.cropWidth, cropHeight: target.cropHeight,
                                           width: target.width, height: target.height,
                                           outputType: outputType.identifier,
-                                          watermarkText: watermarkIsVisible ? settings.watermarkText : nil,
+                                          watermarkText: watermarkIsVisible && settings.watermarkKind == .text ? settings.watermarkText : nil,
+                                          watermarkImage: watermarkIsVisible && settings.watermarkKind == .png ? settings.watermarkImage : nil,
+                                      watermarkCorner: settings.watermarkCorner, watermarkSize: settings.watermarkSize,
+                                      watermarkPadding: settings.watermarkPadding,
                                           watermarkStrength: settings.watermarkStrength,
                                           photoshopWhiteMatte: photoshopWhiteMatte,
                                           cancelled: cancelled)
@@ -750,6 +768,8 @@ final class ResizeEngine {
     private static func reducedImage(_ image: CGImage, orientation: Int,
                                      cropRect: CGRect, cropWidth: Int, cropHeight: Int, width: Int, height: Int,
                                      outputType: String, watermarkText: String? = nil,
+                                     watermarkImage: CGImage? = nil, watermarkCorner: WatermarkCorner = .lowerRight,
+                                     watermarkSize: Double = 0.25, watermarkPadding: Double = 0.03,
                                      watermarkStrength: Double = 0.25,
                                      photoshopWhiteMatte: Bool = false,
                                      optimizedForWeb: Bool = false,
@@ -835,12 +855,18 @@ final class ResizeEngine {
             }
         }
         try checkCancellation(cancelled)
-        if let watermarkText = watermarkText {
+        if watermarkText != nil || watermarkImage != nil {
             guard let watermarkContext = CGContext(data: output.data, width: width, height: height,
                       bitsPerComponent: processingDepth, bytesPerRow: output.rowBytes, space: space,
                       bitmapInfo: processingInfo) else { throw ResizeError.allocation }
-            try TextWatermark.draw(text: watermarkText, in: watermarkContext, width: width, height: height,
-                                   strength: watermarkStrength)
+            if let image = watermarkImage {
+                try PNGWatermark.draw(image: image, in: watermarkContext, width: width, height: height,
+                                      corner: watermarkCorner, size: watermarkSize, padding: watermarkPadding,
+                                      strength: watermarkStrength)
+            } else if let text = watermarkText {
+                try TextWatermark.draw(text: text, in: watermarkContext, width: width, height: height,
+                                       strength: watermarkStrength)
+            }
             watermarkContext.flush()
         }
         try checkCancellation(cancelled)

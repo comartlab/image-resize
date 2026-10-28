@@ -14,7 +14,7 @@ esac
 TEST_BINARY="$BUILD/resize-tests-$TEST_ARCH"
 mkdir -p "$BUILD/module-cache"
 xcrun swiftc -O -target "$TEST_ARCH-apple-macosx12.0" -module-cache-path "$BUILD/module-cache" \
-  "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" \
+  "$ROOT/Sources/CropSelection.swift" "$ROOT/Sources/ResizeEngine.swift" "$ROOT/Sources/TextWatermark.swift" "$ROOT/Sources/PNGWatermark.swift" \
   "$ROOT/Sources/ImageQueue.swift" "$ROOT/Sources/ImageDiscovery.swift" "$ROOT/Sources/OutputEstimateStore.swift" \
   "$ROOT/Tests/LayerFixtures.swift" "$ROOT/Tests/main.swift" \
   -framework AppKit -framework Accelerate -framework ImageIO -framework CoreText -framework UniformTypeIdentifiers \
