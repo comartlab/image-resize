@@ -12,8 +12,155 @@ import Darwin
     static func button(_ editor: CropEditorController, _ title: String) -> NSButton {
         descendants(editor.window!.contentView!).compactMap { $0 as? NSButton }.first { $0.title == title }!
     }
+    private struct Raster {
+        let width: Int, height: Int
+        let bytes: [UInt8]
+        // Drawing uses flipped view coordinates, matching the bitmap
+        // readback's top-left row order.
+        func pixel(_ x: CGFloat, _ y: CGFloat) -> [UInt8] {
+            let px = min(width - 1, max(0, Int(x)))
+            let py = min(height - 1, max(0, Int(y)))
+            let offset = (py * width + px) * 4
+            return Array(bytes[offset..<offset + 4])
+        }
+        var greenBounds: CGRect? {
+            var points = [CGPoint]()
+            for y in 0..<height { for x in 0..<width {
+                let p = pixel(CGFloat(x), CGFloat(y))
+                if p[0] < 40 && p[1] > 200 && p[2] < 40 {
+                    points.append(CGPoint(x: x, y: y))
+                }
+            } }
+            guard let first = points.first else { return nil }
+            return points.dropFirst().reduce(CGRect(origin: first, size: CGSize(width: 1, height: 1))) {
+                $0.union(CGRect(origin: $1, size: CGSize(width: 1, height: 1)))
+            }
+        }
+    }
+    private static func raster(width: Int, height: Int, draw: (CGContext) -> Void) -> Raster {
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue)!
+        context.setFillColor(CGColor(gray: 1, alpha: 1)); context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.translateBy(x: 0, y: CGFloat(height)); context.scaleBy(x: 1, y: -1)
+        draw(context); context.flush()
+        return Raster(width: width, height: height,
+            bytes: Array(UnsafeBufferPointer(start: context.data!.assumingMemoryBound(to: UInt8.self), count: width * height * 4)))
+    }
+    private static func logo() -> CGImage {
+        // Transparent left half, green top-right and yellow bottom-right make
+        // vertical flips, corner errors, and unwanted opacity easy to detect.
+        var bytes = [UInt8](repeating: 0, count: 40 * 20 * 4)
+        for y in 0..<20 { for x in 20..<40 {
+            let offset = (y * 40 + x) * 4
+            bytes[offset] = y < 10 ? 0 : 255; bytes[offset + 1] = 255; bytes[offset + 3] = 255
+        } }
+        return CGImage(width: 40, height: 20, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: 160,
+            space: CGColorSpace(name: CGColorSpace.sRGB)!,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+            provider: CGDataProvider(data: Data(bytes) as CFData)!, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+    }
+    private static func watermarkChecks() {
+        let logo = logo()
+        var settings = ResizeSettings(); settings.mode = .longestEdge; settings.width = 1600
+        settings.watermarkEnabled = true; settings.watermarkKind = .png; settings.watermarkImage = logo
+        settings.watermarkStrength = 1; settings.watermarkSize = 0.4; settings.watermarkPadding = 0.05
+        // A saved batch crop must not replace the editor's current draft.
+        settings.crop = CropSelection(x: 0.65, y: 0.65, width: 0.3, height: 0.3)
+        let draft = CropSelection(x: 0.2, y: 0.15, width: 0.6, height: 0.65)
+        var renderChecks = 0
+        for sourceSize in [CGSize(width: 400, height: 400), CGSize(width: 600, height: 400), CGSize(width: 400, height: 600)] {
+            let image = CGRect(x: 20, y: 30, width: sourceSize.width, height: sourceSize.height)
+            let crop = CGRect(x: image.minX + sourceSize.width * 0.2, y: image.minY + sourceSize.height * 0.15,
+                              width: sourceSize.width * 0.6, height: sourceSize.height * 0.65)
+            let shorter = min(crop.width, crop.height), inset = shorter * 0.05
+            let w = shorter * 0.4, h = w / 2
+            for corner in WatermarkCorner.allCases {
+                settings.watermarkCorner = corner
+                let bitmap = raster(width: Int(sourceSize.width) + 80, height: Int(sourceSize.height) + 80) { context in
+                    let transform = context.ctm, clip = context.boundingBoxOfClipPath
+                    try! CropWatermarkPreview.draw(settings: settings, selection: draft, sourceSize: sourceSize, imageRect: image, in: context)
+                    require(context.ctm == transform && context.boundingBoxOfClipPath == clip, "Watermark leaks graphics state")
+                }
+                let right = corner == .upperRight || corner == .lowerRight
+                let upper = corner == .upperLeft || corner == .upperRight
+                let x = right ? crop.maxX - inset - w : crop.minX + inset
+                let y = upper ? crop.minY + inset : crop.maxY - inset - h
+                require(bitmap.pixel(x + w * 0.75, y + h * 0.25) == [0, 255, 0, 255], "PNG preview top/corner/scale mismatch")
+                require(bitmap.pixel(x + w * 0.75, y + h * 0.75) == [255, 255, 0, 255], "PNG preview is upside down")
+                require(bitmap.pixel(x + w * 0.25, y + h * 0.25) == [255, 255, 255, 255], "PNG preview loses transparency")
+                for py in 0..<bitmap.height { for px in 0..<bitmap.width {
+                    let value = bitmap.pixel(CGFloat(px), CGFloat(py))
+                    if value != [255, 255, 255, 255] {
+                        require(crop.contains(CGPoint(x: px, y: py)), "Watermark escapes draft crop")
+                    }
+                } }
+                renderChecks += 1
+            }
+        }
+        let sourceSize = CGSize(width: 2000, height: 1600), image = CGRect(x: 20, y: 30, width: 500, height: 400)
+        settings.mode = .percent; settings.percent = 50; settings.watermarkKind = .text; settings.watermarkText = "SAMPLE"
+        func text(_ current: ResizeSettings) -> Raster {
+            raster(width: 560, height: 460) {
+                try! CropWatermarkPreview.draw(settings: current, selection: draft, sourceSize: sourceSize, imageRect: image, in: $0)
+            }
+        }
+        let marked = text(settings)
+        var disabled = settings; disabled.watermarkEnabled = false
+        let clean = text(disabled)
+        var zero = settings; zero.watermarkStrength = 0
+        require(text(zero).bytes == clean.bytes, "Zero strength shows a crop watermark")
+        require(marked.bytes != clean.bytes, "Text watermark missing from crop preview")
+        let crop = CGRect(x: 120, y: 90, width: 300, height: 260)
+        var altered = 0
+        for y in 0..<marked.height { for x in 0..<marked.width {
+            if marked.pixel(CGFloat(x), CGFloat(y)) != clean.pixel(CGFloat(x), CGFloat(y)) {
+                altered += 1; require(crop.contains(CGPoint(x: x, y: y)), "Text preview escapes draft crop")
+            }
+        } }
+        require(altered > 100, "Text watermark is not visibly rendered")
+
+        let white = NSImage(size: CGSize(width: 40, height: 30), flipped: false) { rect in
+            NSColor.white.setFill(); rect.fill(); return true
+        }
+        let selection = CropSelection(x: 0.2, y: 0.2, width: 0.5, height: 0.5)
+        settings.mode = .originalDimensions; settings.watermarkKind = .png; settings.watermarkCorner = .upperLeft
+        let editor = CropEditorController(itemName: "Watermark", image: white, sourceSize: CGSize(width: 4000, height: 3000),
+            selection: selection, aspect: .free, watermarkSettings: settings) { _, _ in
+                require(false, "Watermark updates commit crop changes")
+            }
+        editor.window!.contentView!.layoutSubtreeIfNeeded()
+        let canvas = descendants(editor.window!.contentView!).first { String(describing: type(of: $0)) == "CropCanvas" }!
+        func capture() -> Raster {
+            raster(width: Int(canvas.bounds.width.rounded(.up)), height: Int(canvas.bounds.height.rounded(.up))) { context in
+                NSGraphicsContext.saveGraphicsState()
+                NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+                canvas.draw(canvas.bounds)
+                NSGraphicsContext.restoreGraphicsState()
+            }
+        }
+        let initial = capture(), upper = initial.greenBounds
+        require(upper != nil, "Controller initializer does not display watermark")
+        var off = settings; off.watermarkEnabled = false
+        canvas.needsDisplay = false; editor.updateWatermark(off)
+        require(canvas.needsDisplay && capture().greenBounds == nil, "Settings refresh does not remove watermark")
+        require(editor.selection == selection && !editor.hasChanges && !editor.undoManager!.canUndo, "Watermark refresh changes crop/history")
+        settings.watermarkCorner = .lowerRight; editor.updateWatermark(settings)
+        let lowerImage = capture(), lower = lowerImage.greenBounds!
+        require(lower.minX > upper!.minX && lower.minY > upper!.minY, "Live corner setting does not move canvas watermark")
+        button(editor, "Reset").performClick(nil)
+        let resetImage = capture(), reset = resetImage.greenBounds!
+        require(reset.maxX > lower.maxX && reset.maxY > lower.maxY, "Reset does not re-anchor watermark to full image")
+        editor.undo(nil)
+        require(editor.selection == selection && capture().bytes == lowerImage.bytes, "Undo fails to restore draft watermark placement")
+        editor.redo(nil)
+        require(editor.selection == nil && capture().bytes == resetImage.bytes, "Redo fails to restore reset watermark placement")
+        editor.close()
+        print("PASS \(renderChecks) PNG crop-preview corner/shape renders, text/zero strength, native settings refresh, reset, undo and redo")
+    }
     static func main() {
         _ = NSApplication.shared
+        watermarkChecks()
         var checks = 0
         let sizes = [CGSize(width: 4000, height: 3000), CGSize(width: 3000, height: 4000), CGSize(width: 8000, height: 1000)]
         for size in sizes {

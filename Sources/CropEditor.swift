@@ -73,6 +73,44 @@ enum CropEditorGeometry {
     }
 }
 
+/// Share the export watermark renderers, mapping their bottom-left pixel
+/// coordinates into the editor's flipped view. Only the draft crop is marked;
+/// its source pixels and the saved batch crop remain untouched.
+enum CropWatermarkPreview {
+    static func draw(settings: ResizeSettings, selection: CropSelection?, sourceSize: CGSize,
+                     imageRect: CGRect, in context: CGContext) throws {
+        guard settings.watermarkEnabled, settings.watermarkStrength > 0,
+              let sourceWidth = Int(exactly: sourceSize.width.rounded()),
+              let sourceHeight = Int(exactly: sourceSize.height.rounded()),
+              sourceWidth > 0, sourceHeight > 0, imageRect.width > 0, imageRect.height > 0 else { return }
+        var draft = settings
+        draft.crop = selection
+        let plan = try ResizeEngine.outputPlan(width: sourceWidth, height: sourceHeight, settings: draft)
+        let crop = CGRect(x: imageRect.minX + plan.cropRect.minX / CGFloat(sourceWidth) * imageRect.width,
+                          y: imageRect.minY + plan.cropRect.minY / CGFloat(sourceHeight) * imageRect.height,
+                          width: CGFloat(plan.cropWidth) / CGFloat(sourceWidth) * imageRect.width,
+                          height: CGFloat(plan.cropHeight) / CGFloat(sourceHeight) * imageRect.height)
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.clip(to: crop)
+        context.translateBy(x: crop.minX, y: crop.maxY)
+        context.scaleBy(x: crop.width / CGFloat(plan.width), y: -crop.height / CGFloat(plan.height))
+        switch settings.watermarkKind {
+        case .text:
+            try TextWatermark.draw(text: settings.watermarkText, in: context, width: plan.width, height: plan.height,
+                                   strength: settings.watermarkStrength)
+        case .png:
+            try PNGWatermark.validate(image: settings.watermarkImage, size: settings.watermarkSize,
+                                      padding: settings.watermarkPadding, strength: settings.watermarkStrength)
+            if let image = settings.watermarkImage {
+                try PNGWatermark.draw(image: image, in: context, width: plan.width, height: plan.height,
+                                      corner: settings.watermarkCorner, size: settings.watermarkSize,
+                                      padding: settings.watermarkPadding, strength: settings.watermarkStrength)
+            }
+        }
+    }
+}
+
 private enum CropHandle: CaseIterable {
     case topLeft, top, topRight, right, bottomRight, bottom, bottomLeft, left
 
@@ -151,6 +189,7 @@ private final class CropCanvas: NSView, NSUserInterfaceValidations {
 
     let image: NSImage
     let sourceSize: CGSize
+    var watermarkSettings = ResizeSettings() { didSet { needsDisplay = true } }
     var selection: CropSelection? { didSet { needsDisplay = true; updateAccessibility() } }
     var aspect: CropAspect
     var onCommit: ((CropSelection?, String) -> Void)?
@@ -228,6 +267,12 @@ private final class CropCanvas: NSView, NSUserInterfaceValidations {
         checkerboard.setFill(); imageRect.fill()
         image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1,
                    respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+        if let context = NSGraphicsContext.current?.cgContext {
+            // Invalid/incomplete main-window settings leave the source preview
+            // usable for cropping; the main window already explains the error.
+            try? CropWatermarkPreview.draw(settings: watermarkSettings, selection: selection,
+                                          sourceSize: sourceSize, imageRect: imageRect, in: context)
+        }
         guard let normalized = displayedSelection else { return }
         let crop = viewRect(normalized)
         let shade = NSBezierPath(rect: imageRect)
@@ -411,6 +456,7 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
     override var undoManager: UndoManager? { history }
 
     init(itemName: String, image: NSImage, sourceSize: CGSize, selection: CropSelection?, aspect: CropAspect,
+         watermarkSettings: ResizeSettings = ResizeSettings(),
          onApply: @escaping (CropSelection?, CropAspect) -> Void) {
         let safeSize = CGSize(width: sourceSize.width.isFinite && sourceSize.width > 0 ? sourceSize.width : 1,
                               height: sourceSize.height.isFinite && sourceSize.height > 0 ? sourceSize.height : 1)
@@ -420,6 +466,7 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
         self.selection = selection; self.aspect = aspect; self.onApply = onApply
         self.initialState = State(selection: selection, aspect: aspect)
         self.canvas = CropCanvas(image: image, sourceSize: safeSize, selection: selection, aspect: aspect)
+        self.canvas.watermarkSettings = watermarkSettings
         // This is an editor window, so it remains visible when the application
         // temporarily loses focus and can become the main window when reopened.
         let panel = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 820, height: 690),
@@ -444,6 +491,10 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
     }
     required init?(coder: NSCoder) { fatalError() }
     deinit { NotificationCenter.default.removeObserver(self) }
+
+    func updateWatermark(_ settings: ResizeSettings) {
+        canvas.watermarkSettings = settings
+    }
 
     func show() {
         showWindow(nil); window?.center(); window?.makeKeyAndOrderFront(nil)

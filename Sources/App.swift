@@ -642,6 +642,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return nil
     }
     private func updateState() {
+        cropEditor?.updateWatermark(settings)
         let locked = busy
         [addButton, clearButton, recursive, metadata, watermark, folderButton].forEach { $0.isEnabled = !locked }
         metadata.isEnabled = !locked && settings.format != .web
@@ -974,7 +975,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     @objc private func showCropEditor(_ sender: Any?) {
         guard !busy, let item = previewItem else { return }
         window.makeFirstResponder(nil)
-        if cropSourceID == item.id, let editor = cropEditor { editor.show(); return }
+        if cropSourceID == item.id, let editor = cropEditor {
+            editor.updateWatermark(settings); editor.show(); return
+        }
         dismissPreview(); dismissCropEditor()
         cropSourceID = item.id
         let generation = cropGeneration
@@ -1002,6 +1005,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                     let controller = CropEditorController(itemName: item.url.lastPathComponent, image: image,
                         sourceSize: CGSize(width: inspected.width, height: inspected.height),
                         selection: self.cropSelection, aspect: self.cropAspect,
+                        watermarkSettings: self.settings,
                         onApply: { [weak self] crop, aspect in self?.applyCrop(crop, aspect: aspect) })
                     controller.onClose = { [weak self, weak controller] in
                         guard let self = self, self.cropEditor === controller else { return }
