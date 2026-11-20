@@ -5,6 +5,55 @@ import AppKit
 import ImageIO
 import QuickLookThumbnailing
 
+final class CropThumbnailView: NSView {
+    private var image: NSImage?
+    private var sourceSize = CGSize.zero
+    private var cropRect: CGRect?
+
+    override var isFlipped: Bool { true }
+
+    func update(image: NSImage?, sourceSize: CGSize, cropRect: CGRect?) {
+        guard self.image !== image || self.sourceSize != sourceSize || self.cropRect != cropRect else { return }
+        self.image = image
+        self.sourceSize = sourceSize
+        self.cropRect = cropRect
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard image != nil || cropRect != nil else { return }
+        let size = image?.size ?? sourceSize
+        guard size.width > 0, size.height > 0, !bounds.isEmpty else { return }
+        let scale = min(bounds.width / size.width, bounds.height / size.height)
+        let width = size.width * scale, height = size.height * scale
+        let imageRect = CGRect(x: bounds.midX - width / 2, y: bounds.midY - height / 2,
+                               width: width, height: height)
+        if let image = image {
+            image.draw(in: imageRect, from: .zero, operation: .sourceOver, fraction: 1,
+                       respectFlipped: true, hints: [.interpolation: NSImageInterpolation.high])
+        } else {
+            NSColor.quaternaryLabelColor.setFill(); imageRect.fill()
+        }
+
+        guard let cropRect = cropRect, sourceSize.width > 0, sourceSize.height > 0 else { return }
+        let scaleX = width / sourceSize.width, scaleY = height / sourceSize.height
+        let crop = CGRect(x: imageRect.minX + cropRect.minX * scaleX, y: imageRect.minY + cropRect.minY * scaleY,
+                          width: cropRect.width * scaleX, height: cropRect.height * scaleY)
+
+        NSGraphicsContext.saveGraphicsState()
+        defer { NSGraphicsContext.restoreGraphicsState() }
+        NSBezierPath(rect: imageRect).addClip()
+        let shade = NSBezierPath(rect: imageRect)
+        shade.appendRect(crop)
+        shade.windingRule = .evenOdd
+        NSColor.black.withAlphaComponent(0.56).setFill(); shade.fill()
+
+        let outline = NSBezierPath(rect: crop)
+        NSColor.black.withAlphaComponent(0.8).setStroke(); outline.lineWidth = 2.5; outline.stroke()
+        NSColor.white.setStroke(); outline.lineWidth = 1; outline.stroke()
+    }
+}
+
 enum ImagePreview {
     /// A larger, oriented source preview requested explicitly by the user.
     /// It is independent of output size, crop, watermark and fitting-file skips.

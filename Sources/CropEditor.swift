@@ -3,6 +3,10 @@
 
 import AppKit
 
+enum CropScope {
+    case image, batch
+}
+
 /// Crop coordinates are normalized against the oriented source, with a top-left
 /// origin. Keep drag calculations independent of the preview bitmap's size.
 enum CropEditorGeometry {
@@ -74,8 +78,7 @@ enum CropEditorGeometry {
 }
 
 /// Share the export watermark renderers, mapping their bottom-left pixel
-/// coordinates into the editor's flipped view. Only the draft crop is marked;
-/// its source pixels and the saved batch crop remain untouched.
+/// coordinates into the editor's flipped view over the draft crop.
 enum CropWatermarkPreview {
     static func draw(settings: ResizeSettings, selection: CropSelection?, sourceSize: CGSize,
                      imageRect: CGRect, in context: CGContext) throws {
@@ -445,7 +448,7 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
     var hasChanges: Bool { state != initialState }
     private let initialState: State
-    private let onApply: (CropSelection?, CropAspect) -> Void
+    private let onApply: (CropSelection?, CropAspect, CropScope) -> Void
     private let history = UndoManager()
     private let canvas: CropCanvas
     private let aspectPicker = NSPopUpButton()
@@ -456,8 +459,9 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
     override var undoManager: UndoManager? { history }
 
     init(itemName: String, image: NSImage, sourceSize: CGSize, selection: CropSelection?, aspect: CropAspect,
+         scope: CropScope,
          watermarkSettings: ResizeSettings = ResizeSettings(),
-         onApply: @escaping (CropSelection?, CropAspect) -> Void) {
+         onApply: @escaping (CropSelection?, CropAspect, CropScope) -> Void) {
         let safeSize = CGSize(width: sourceSize.width.isFinite && sourceSize.width > 0 ? sourceSize.width : 1,
                               height: sourceSize.height.isFinite && sourceSize.height > 0 ? sourceSize.height : 1)
         // A saved normalized box also applies to images of other proportions.
@@ -480,7 +484,7 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
                                                name: .NSUndoManagerDidUndoChange, object: history)
         NotificationCenter.default.addObserver(self, selector: #selector(historyChanged(_:)),
                                                name: .NSUndoManagerDidRedoChange, object: history)
-        buildInterface(in: panel)
+        buildInterface(in: panel, scope: scope)
         canvas.onCommit = { [weak self] selection, name in
             guard let self = self else { return }
             self.change(to: State(selection: selection, aspect: self.aspect), action: name)
@@ -506,7 +510,7 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
         let handler = onClose; onClose = nil; handler?()
     }
 
-    private func buildInterface(in window: NSWindow) {
+    private func buildInterface(in window: NSWindow, scope: CropScope) {
         guard let content = window.contentView else { return }
         aspectPicker.addItems(withTitles: CropAspect.allCases.map(\.title))
         aspectPicker.target = self; aspectPicker.action = #selector(aspectChanged(_:))
@@ -521,11 +525,17 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
         let toolbar = NSStackView(views: [NSTextField(labelWithString: "Aspect"), aspectPicker, spacer, undoButton, redoButton, resetButton])
         toolbar.orientation = .horizontal; toolbar.alignment = .centerY; toolbar.spacing = 8
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancelCrop(_:)))
-        let apply = NSButton(title: "Apply to Batch", target: self, action: #selector(applyCrop(_:)))
-        [cancel, apply].forEach { $0.bezelStyle = .rounded }
-        cancel.keyEquivalent = "\u{1b}"; apply.keyEquivalent = "\r"
-        apply.toolTip = "Apply this crop to every image in the batch."
-        let footer = NSStackView(views: [cancel, apply])
+        let applyImage = NSButton(title: "Apply to This Image", target: self, action: #selector(applyImageCrop(_:)))
+        let applyBatch = NSButton(title: "Apply to Batch", target: self, action: #selector(applyBatchCrop(_:)))
+        [cancel, applyImage, applyBatch].forEach { $0.bezelStyle = .rounded }
+        cancel.keyEquivalent = "\u{1b}"
+        let defaultButton = scope == .image ? applyImage : applyBatch
+        defaultButton.keyEquivalent = "\r"
+        applyImage.toolTip = "Update the crop for this image."
+        applyImage.setAccessibilityHelp(applyImage.toolTip)
+        applyBatch.toolTip = "Update the crop for every image in the batch."
+        applyBatch.setAccessibilityHelp(applyBatch.toolTip)
+        let footer = NSStackView(views: [cancel, applyImage, applyBatch])
         footer.orientation = .horizontal; footer.alignment = .centerY; footer.spacing = 8
         [toolbar, canvas, footer].forEach { $0.translatesAutoresizingMaskIntoConstraints = false; content.addSubview($0) }
         NSLayoutConstraint.activate([
@@ -536,6 +546,7 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
             canvas.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             canvas.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             canvas.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -10),
+            footer.leadingAnchor.constraint(greaterThanOrEqualTo: content.leadingAnchor, constant: 14),
             footer.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
             footer.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
         ])
@@ -594,7 +605,10 @@ final class CropEditorController: NSWindowController, NSWindowDelegate {
     @objc private func historyChanged(_ notification: Notification) { updateControls() }
     @objc private func resetCrop(_ sender: Any?) { change(to: State(selection: nil, aspect: .free), action: "Reset Crop") }
     @objc private func cancelCrop(_ sender: Any?) { close() }
-    @objc private func applyCrop(_ sender: Any?) {
-        canvas.finishInteraction(); onApply(selection, aspect); close()
+    @objc private func applyImageCrop(_ sender: Any?) { applyCrop(scope: .image) }
+    @objc private func applyBatchCrop(_ sender: Any?) { applyCrop(scope: .batch) }
+
+    private func applyCrop(scope: CropScope) {
+        canvas.finishInteraction(); onApply(selection, aspect, scope); close()
     }
 }

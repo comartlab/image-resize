@@ -54,15 +54,14 @@ private final class ImageTable: NSTableView {
 }
 
 private final class ImageCell: NSTableCellView {
-    let thumbnail = NSImageView()
+    let thumbnail = CropThumbnailView()
     let filename = NSTextField(labelWithString: "")
     let details = NSTextField(labelWithString: "")
     let result = NSTextField(labelWithString: "")
     override init(frame: NSRect) {
         super.init(frame: frame)
-        thumbnail.imageScaling = .scaleProportionallyUpOrDown
         thumbnail.setAccessibilityElement(false)
-        toolTip = "Double-click to preview and crop. The crop applies to the batch."
+        toolTip = "Double-click to preview and crop this image or the batch."
         thumbnail.toolTip = toolTip
         filename.lineBreakMode = .byTruncatingMiddle
         filename.font = .systemFont(ofSize: 13, weight: .medium)
@@ -109,6 +108,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var outputFolder: URL?
     private var log: [String] = []
     private var busy = false
+    private var showsBatchSummary = false
     private var pendingDiscoveries = 0
     private var importing: Bool { pendingDiscoveries > 0 }
     private var discoveryGeneration = 0
@@ -122,6 +122,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private struct PendingBatch {
         let folder: URL
         let settings: ResizeSettings
+        let crops: CropAssignments
         let cancellation: CancellationToken
         let start: Date
     }
@@ -149,14 +150,15 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private var previewGeneration = 0
     private var previewPending = false
     private var previewCancellation: CancellationToken?
-    private var cropSelection: CropSelection?
-    private var cropAspect: CropAspect = .free
+    private var crops = CropAssignments()
+    private var batchCropAspect: CropAspect = .free
     private var cropEditor: CropEditorController?
     private var cropLoadingPanel: NSPanel?
     private var cropSourceID: UUID?
     private var cropGeneration = 0
     private var cropCancellation: CancellationToken?
     private let cropUndoManager = UndoManager()
+    private var imageCropUndoTargets: [UUID: NSObject] = [:]
     private let processingQueue = DispatchQueue(label: "com.cjohnson.imageresize.processing", qos: .userInitiated)
     private let table = ImageTable()
     private let drop = DropArea()
@@ -164,7 +166,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     private let addButton = NSButton(title: "Add…", target: nil, action: nil)
     private let clearButton = NSButton(title: "Clear", target: nil, action: nil)
     private let cropButton = NSButton(title: "Preview & Crop…", target: nil, action: nil)
-    private let resetCropButton = NSButton(title: "Reset Crop", target: nil, action: nil)
+    private let resetCropButton = NSButton(title: "Reset Crops", target: nil, action: nil)
     private let recursive = NSButton(checkboxWithTitle: "Subfolders", target: nil, action: nil)
     private let mode = NSPopUpButton()
     private let firstValue = NSTextField(string: "1600")
@@ -216,9 +218,10 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         result.watermarkPadding = watermarkPadding.doubleValue / 100
         result.watermarkText = watermarkText.stringValue
         result.watermarkStrength = watermarkStrength.doubleValue / 100
-        result.crop = cropSelection
         return result
     }
+
+    private func settings(for item: ImageItem) -> ResizeSettings { crops.settings(for: item.id, base: settings) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         createMenus()
@@ -310,7 +313,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         button(addButton, action: #selector(addImages(_:))); button(clearButton, action: #selector(clear(_:)))
         button(cropButton, action: #selector(showCropEditor(_:)))
         button(resetCropButton, action: #selector(resetCrop(_:)))
-        cropButton.toolTip = "Preview the selected image and set a crop for the batch."
+        cropButton.toolTip = "Preview the selected image and set a crop for this image or the batch."
+        resetCropButton.toolTip = "Clear the batch crop and all individual crops."
         recursive.state = .on
         recursive.target = self; recursive.action = #selector(optionsChanged(_:))
         let inputRow = row([addButton, clearButton, cropButton, resetCropButton, flexible(), recursive])
@@ -320,7 +324,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         table.dataSource = self; table.delegate = self; table.backgroundColor = .controlBackgroundColor
         table.setAccessibilityLabel("Images to resize")
         table.removeSelection = { [weak self] in self?.removeSelected() }
-        table.target = self; table.doubleAction = #selector(showCropEditor(_:))
+        table.target = self; table.doubleAction = #selector(cropClickedRow(_:))
         let contextMenu = NSMenu()
         contextMenu.addItem(withTitle: "Remove", action: #selector(removeRows(_:)), keyEquivalent: "").target = self
         contextMenu.addItem(withTitle: "Preview & Crop…", action: #selector(cropClickedRow(_:)), keyEquivalent: "").target = self
@@ -384,7 +388,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         strengthLabel.widthAnchor.constraint(equalToConstant: 35).isActive = true
         previewButton.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "Preview watermark")
         previewButton.imagePosition = .imageOnly; previewButton.bezelStyle = .rounded
-        previewButton.target = self; previewButton.action = #selector(showPreview(_:)); previewButton.toolTip = "Preview the watermark. Choose Crop in the preview to crop the batch."
+        previewButton.target = self; previewButton.action = #selector(showPreview(_:)); previewButton.toolTip = "Preview the watermark or open the crop editor."
         let watermarkRow = row([watermark, watermarkType, watermarkText, watermarkPNGButton, strengthTitle, watermarkStrength, strengthLabel, previewButton])
         watermarkPosition.addItems(withTitles: ["Upper left", "Upper right", "Lower left", "Lower right"])
         watermarkPosition.selectItem(at: 3)
@@ -487,9 +491,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         if let url = pngURL { loadWatermarkPNG(url) }
         if let path = prefs.string(forKey: "output") { outputFolder = URL(fileURLWithPath: path, isDirectory: true) }
-        if let saved = prefs.string(forKey: "cropAspect"), let aspect = CropAspect(rawValue: saved) { cropAspect = aspect }
+        if let saved = prefs.string(forKey: "cropAspect"), let aspect = CropAspect(rawValue: saved) { batchCropAspect = aspect }
         if let data = prefs.data(forKey: "cropSelection"), let crop = try? JSONDecoder().decode(CropSelection.self, from: data),
-           (try? crop.pixelRect(width: 1000, height: 1000)) != nil { cropSelection = crop; cropAspect = crop.aspect }
+           (try? crop.pixelRect(width: 1000, height: 1000)) != nil { crops = CropAssignments(batch: crop); batchCropAspect = crop.aspect }
         updateFolder()
     }
     private func savePreferences() {
@@ -516,8 +520,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         prefs.set(watermarkPadding.doubleValue, forKey: "watermarkPadding")
         prefs.set(watermarkPNGURL?.path, forKey: "watermarkPNGPath")
         prefs.set(watermarkPNGBookmark, forKey: "watermarkPNGBookmark")
-        prefs.set(cropAspect.rawValue, forKey: "cropAspect")
-        if let crop = cropSelection, let data = try? JSONEncoder().encode(crop) { prefs.set(data, forKey: "cropSelection") }
+        prefs.set(batchCropAspect.rawValue, forKey: "cropAspect")
+        if let crop = crops.batch, let data = try? JSONEncoder().encode(crop) { prefs.set(data, forKey: "cropSelection") }
         else { prefs.removeObject(forKey: "cropSelection") }
     }
     @objc private func chooseWatermarkPNG(_ sender: Any?) {
@@ -649,7 +653,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         allowUpscaling.isEnabled = !locked && settings.mode != .originalDimensions
         clearButton.isEnabled = !locked && (!items.isEmpty || importing)
         cropButton.isEnabled = !locked && !items.isEmpty
-        resetCropButton.isEnabled = !locked && cropSelection != nil
+        resetCropButton.isEnabled = !locked && crops.hasCrops
         [mode, format].forEach { $0.isEnabled = !locked }
         [firstValue, secondValue].forEach { $0.isEnabled = !locked }
         watermarkType.isEnabled = !locked && watermark.state == .on
@@ -672,6 +676,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         startButton.isEnabled = busy || ((!items.isEmpty || importing) && outputFolder != nil && validationMessage() == nil)
         startButton.keyEquivalent = busy ? "\u{1b}" : "\r"
         if !busy {
+            showsBatchSummary = false
             if let invalid = validationMessage() { status.stringValue = invalid }
             else {
                 updateEstimateSummary()
@@ -683,13 +688,13 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         return items.indices.contains(index) ? items[index] : nil
     }
     private func willExport(_ item: ImageItem) -> Bool {
-        guard item.isInspected, let plan = try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: settings) else { return false }
+        guard item.isInspected, let plan = try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: settings(for: item)) else { return false }
         return !plan.skipped
     }
     private func updatePreviewState() {
         let exports = previewItem.map(willExport) ?? false
         previewButton.isEnabled = !busy && !previewPending && exports && watermark.state == .on && validationMessage() == nil
-        previewButton.toolTip = previewItem?.isInspected == false ? "Preview is loading in the background." : (exports ? "Preview the watermark. Choose Crop in the preview to crop the batch." : "This image will be skipped at the selected size.")
+        previewButton.toolTip = previewItem?.isInspected == false ? "Preview is loading in the background." : (exports ? "Preview the watermark or open the crop editor." : "This image will be skipped at the selected size.")
     }
     func tableViewSelectionDidChange(_ notification: Notification) {
         if previewSourceID != previewItem?.id { dismissPreview() }
@@ -761,7 +766,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         guard let item = next else { return }
         let generation = outputEstimates.generation
         let cancellation = estimateCancellation
-        let current = settings
+        let current = settings(for: item)
         estimateWorkerActive = true
         // Share the serial image worker so estimates and exports never hold
         // two full-resolution processing buffers concurrently. Only this one
@@ -791,7 +796,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                     }
                     if self.outputEstimates.record(value, for: item.id, generation: generation) {
                         self.reloadImageRow(item.id)
-                        if self.rowResults.isEmpty { self.updateEstimateSummary() }
+                        if !self.showsBatchSummary { self.updateEstimateSummary() }
                     }
                 }
                 self.startNextEstimate()
@@ -905,6 +910,9 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         discoveryGeneration += 1; pendingDiscoveries = 0
         removedDuringDiscovery.removeAll()
         cancelThumbnailWork(); pauseEstimates(); outputEstimates.clear()
+        crops = CropAssignments(batch: crops.batch)
+        for target in imageCropUndoTargets.values { cropUndoManager.removeAllActions(withTarget: target) }
+        imageCropUndoTargets.removeAll()
         imageQueue.clear(); thumbnails.removeAll(); rowResults.removeAll(); errorIDs.removeAll(); log.removeAll()
         table.reloadData(); progress.isHidden = true; updateState()
     }
@@ -917,8 +925,10 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         }
         pauseEstimates()
         let removed = imageQueue.remove(at: selection)
+        crops.removeOverrides(for: removed)
         outputEstimates.remove(removed)
         for id in removed {
+            if let target = imageCropUndoTargets.removeValue(forKey: id) { cropUndoManager.removeAllActions(withTarget: target) }
             thumbnails.removeValue(forKey: id); thumbnailRequests.remove(id)
             rowResults.removeValue(forKey: id); errorIDs.remove(id)
         }
@@ -944,21 +954,49 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     @objc private func revealOutput(_ sender: Any?) { if let url = outputFolder { NSWorkspace.shared.open(url) } }
     func windowWillReturnUndoManager(_ window: NSWindow) -> UndoManager? { busy ? nil : cropUndoManager }
 
-    private func applyCrop(_ selection: CropSelection?, aspect: CropAspect) {
-        guard !busy, selection != cropSelection || aspect != cropAspect else { return }
-        let previous = cropSelection, previousAspect = cropAspect
-        cropUndoManager.registerUndo(withTarget: self) { owner in
-            owner.dismissCropEditor(); owner.applyCrop(previous, aspect: previousAspect)
+    private func applyImageCrop(_ selection: CropSelection?, to id: UUID) {
+        guard !busy, imageQueue.index(of: id) != nil else { return }
+        let previous = crops.selection(for: id)
+        guard selection != previous else { return }
+        let target = imageCropUndoTargets[id] ?? NSObject()
+        imageCropUndoTargets[id] = target
+        cropUndoManager.registerUndo(withTarget: target) { [weak self] _ in
+            self?.dismissCropEditor(); self?.applyImageCrop(previous, to: id)
         }
-        cropUndoManager.setActionName("Crop")
-        cropSelection = selection; cropAspect = aspect
-        dismissPreview(); rowResults.removeAll(); errorIDs.removeAll(); invalidateEstimates()
+        cropUndoManager.setActionName("Image Crop")
+        crops.set(selection, for: id)
+        cropDidChange(for: id)
+    }
+
+    private func applyBatchCrops(_ assignments: CropAssignments, aspect: CropAspect) {
+        guard !busy else { return }
+        var next = assignments
+        // A batch crop restored by Undo may refer to images since removed from the queue.
+        next.retainOverrides { imageQueue.index(of: $0) != nil }
+        guard next != crops || aspect != batchCropAspect else { return }
+        let previous = crops, previousAspect = batchCropAspect
+        cropUndoManager.registerUndo(withTarget: self) { owner in
+            owner.dismissCropEditor(); owner.applyBatchCrops(previous, aspect: previousAspect)
+        }
+        cropUndoManager.setActionName("Batch Crop")
+        crops = next; batchCropAspect = aspect
+        cropDidChange()
+    }
+
+    private func cropDidChange(for id: UUID? = nil) {
+        dismissPreview()
+        if let id = id {
+            rowResults.removeValue(forKey: id); errorIDs.remove(id)
+            pauseEstimates(); outputEstimates.invalidate(id); scheduleEstimates()
+        } else {
+            rowResults.removeAll(); errorIDs.removeAll(); invalidateEstimates()
+        }
         updateState(); reloadImageRows(); savePreferences()
     }
 
     @objc private func resetCrop(_ sender: Any?) {
         guard !busy else { return }
-        dismissCropEditor(); applyCrop(nil, aspect: .free)
+        dismissCropEditor(); applyBatchCrops(CropAssignments(), aspect: .free)
     }
 
     @objc private func cropClickedRow(_ sender: Any?) {
@@ -1002,11 +1040,19 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 switch result {
                 case .success(let (inspected, image)):
                     _ = self.imageQueue.update(inspected); self.reloadImageRow(item.id); self.updatePreviewState()
+                    let selection = self.crops.selection(for: item.id)
+                    let isIndividual = self.crops.hasOverride(for: item.id)
+                    let scope: CropScope = !isIndividual && selection != nil ? .batch : .image
                     let controller = CropEditorController(itemName: item.url.lastPathComponent, image: image,
                         sourceSize: CGSize(width: inspected.width, height: inspected.height),
-                        selection: self.cropSelection, aspect: self.cropAspect,
+                        selection: selection, aspect: selection?.aspect ?? (isIndividual ? .free : self.batchCropAspect), scope: scope,
                         watermarkSettings: self.settings,
-                        onApply: { [weak self] crop, aspect in self?.applyCrop(crop, aspect: aspect) })
+                        onApply: { [weak self] crop, aspect, scope in
+                            switch scope {
+                            case .image: self?.applyImageCrop(crop, to: item.id)
+                            case .batch: self?.applyBatchCrops(CropAssignments(batch: crop), aspect: aspect)
+                            }
+                        })
                     controller.onClose = { [weak self, weak controller] in
                         guard let self = self, self.cropEditor === controller else { return }
                         self.cropEditor = nil; self.cropSourceID = nil
@@ -1048,8 +1094,8 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         cancelPreviewWork()
         guard let item = previewItem, willExport(item) else { updatePreviewState(); return }
         previewSourceID = item.id
-        guard let target = try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: settings) else { return }
-        var previewSettings = settings
+        var previewSettings = settings(for: item)
+        guard let target = try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: previewSettings) else { return }
         let previewEdge = min(1200, max(target.width, target.height))
         // A preview at the crop's native size must still render its watermark,
         // even when the full export enlarges it beyond the preview limit.
@@ -1121,7 +1167,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             token?.cancel()
             if pendingBatch != nil {
                 pendingBatch = nil; busy = false; token = nil; updateState(); reloadImageRows()
-                status.stringValue = "Stopped"; scheduleEstimates()
+                showsBatchSummary = true; status.stringValue = "Stopped"; scheduleEstimates()
             } else {
                 startButton.isEnabled = false; status.stringValue = "Finishing current image…"
             }
@@ -1131,7 +1177,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
         guard (!items.isEmpty || importing), let folder = outputFolder, validationMessage() == nil else { return }
         dismissPreview(); dismissCropEditor(); cancelThumbnailWork(); pauseEstimates()
         let cancellation = CancellationToken()
-        let request = PendingBatch(folder: folder, settings: settings, cancellation: cancellation, start: Date())
+        let request = PendingBatch(folder: folder, settings: settings, crops: crops, cancellation: cancellation, start: Date())
         token = cancellation; busy = true; rowResults.removeAll(); errorIDs.removeAll(); log.removeAll(); savePreferences()
         progress.doubleValue = 0; progress.isHidden = false; updateState()
         status.stringValue = "Starting…"
@@ -1149,12 +1195,13 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
             if quitAfterBatch { NSApp.reply(toApplicationShouldTerminate: true) }
             return
         }
-        let folder = request.folder, currentSettings = request.settings
+        let folder = request.folder
         let cancellation = request.cancellation, start = request.start
         processingQueue.async { [weak self] in
             var completed = 0; var failed = 0; var outputs = 0; var skipped = 0; var originalBytes: Int64 = 0; var resultingBytes: Int64 = 0
             for item in batch {
                 if cancellation.cancelled { break }
+                let currentSettings = request.crops.settings(for: item.id, base: request.settings)
                 let position = completed + 1
                 DispatchQueue.main.async { self?.status.stringValue = "\(position) / \(batch.count) · \(item.url.lastPathComponent)" }
                 let outcome: Result<ResizeResult, Error> = autoreleasepool {
@@ -1200,6 +1247,7 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
                 self.busy = false; self.token = nil; self.updateState(); self.reloadImageRows()
                 let bytes = ByteCountFormatter.string(fromByteCount: resultingBytes, countStyle: .file)
                 let saved = originalBytes > resultingBytes ? " · saved \(ByteCountFormatter.string(fromByteCount: originalBytes - resultingBytes, countStyle: .file))" : ""
+                self.showsBatchSummary = true
                 self.status.stringValue = "\(cancelled ? "Stopped" : "Done") · \(outputs) saved\(skipped > 0 ? " · \(skipped) skipped" : "")\(failed > 0 ? " · \(failed) failed" : "") · \(bytes)\(saved)"
                 self.status.toolTip = String(format: "%.1f seconds", duration)
                 if self.quitAfterBatch { NSApp.reply(toApplicationShouldTerminate: true) }
@@ -1220,16 +1268,22 @@ final class ApplicationDelegate: NSObject, NSApplicationDelegate, NSWindowDelega
     func numberOfRows(in tableView: NSTableView) -> Int { items.count }
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         let item = items[row]
-        let plan = item.isInspected ? try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: settings) : nil
+        let current = settings(for: item)
+        let plan = item.isInspected ? try? ResizeEngine.outputPlan(width: item.width, height: item.height, settings: current) : nil
         let cell = (tableView.makeView(withIdentifier: .init("cell"), owner: self) as? ImageCell) ?? ImageCell()
         cell.identifier = .init("cell"); cell.filename.stringValue = item.url.lastPathComponent; cell.filename.toolTip = item.url.path
-        if cropSelection != nil, let plan = plan {
+        if current.crop != nil, let plan = plan {
             cell.details.stringValue = "\(item.width) × \(item.height) · Crop \(plan.cropWidth) × \(plan.cropHeight)"
         } else {
             cell.details.stringValue = item.isInspected ? "\(item.width) × \(item.height) · \(ByteCountFormatter.string(fromByteCount: item.fileBytes, countStyle: .file))" : ""
         }
         cell.details.toolTip = cell.details.stringValue
-        cell.thumbnail.image = thumbnails[item.id]
+        let cropRect = item.isInspected ? current.crop.flatMap { selection in
+            plan?.cropRect ?? (try? selection.pixelRect(width: item.width, height: item.height))
+        } : nil
+        let sourceSize = CGSize(width: item.width, height: item.height)
+        cell.thumbnail.update(image: thumbnails[item.id], sourceSize: sourceSize,
+                              cropRect: cropRect == CGRect(origin: .zero, size: sourceSize) ? nil : cropRect)
         requestThumbnail(item)
         cell.result.toolTip = nil
         if let result = rowResults[item.id] { cell.result.stringValue = result }

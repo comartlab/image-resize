@@ -108,6 +108,39 @@ struct CropSelection: Codable, Equatable {
     }
 }
 
+struct CropAssignments: Equatable {
+    let batch: CropSelection?
+    // A stored nil excludes the image from the batch crop.
+    private var overrides: [UUID: CropSelection?] = [:]
+
+    init(batch: CropSelection? = nil) { self.batch = batch }
+
+    var hasCrops: Bool { batch != nil || !overrides.isEmpty }
+
+    func hasOverride(for id: UUID) -> Bool { overrides.keys.contains(id) }
+
+    func selection(for id: UUID) -> CropSelection? { overrides[id] ?? batch }
+
+    func settings(for id: UUID, base: ResizeSettings) -> ResizeSettings {
+        var settings = base
+        settings.crop = selection(for: id)
+        return settings
+    }
+
+    mutating func set(_ selection: CropSelection?, for id: UUID) {
+        if selection == batch { overrides.removeValue(forKey: id) }
+        else { overrides.updateValue(selection, forKey: id) }
+    }
+
+    mutating func removeOverrides(for ids: [UUID]) {
+        for id in ids { overrides.removeValue(forKey: id) }
+    }
+
+    mutating func retainOverrides(where contains: (UUID) -> Bool) {
+        overrides = overrides.filter { contains($0.key) }
+    }
+}
+
 struct ResizeOutputPlan {
     /// Oriented image coordinates with a top-left origin.
     let cropRect: CGRect

@@ -126,7 +126,7 @@ import Darwin
         let selection = CropSelection(x: 0.2, y: 0.2, width: 0.5, height: 0.5)
         settings.mode = .originalDimensions; settings.watermarkKind = .png; settings.watermarkCorner = .upperLeft
         let editor = CropEditorController(itemName: "Watermark", image: white, sourceSize: CGSize(width: 4000, height: 3000),
-            selection: selection, aspect: .free, watermarkSettings: settings) { _, _ in
+            selection: selection, aspect: .free, scope: .batch, watermarkSettings: settings) { _, _, _ in
                 require(false, "Watermark updates commit crop changes")
             }
         editor.window!.contentView!.layoutSubtreeIfNeeded()
@@ -185,17 +185,25 @@ import Darwin
                 let original = CropSelection(x: 0.13, y: 0.17, width: 0.72, height: 0.63, aspect: aspect)
                 var committed: CropSelection? = nil
                 let editor = CropEditorController(itemName: "Test", image: NSImage(size: size), sourceSize: size,
-                    selection: original, aspect: aspect) { crop, _ in committed = crop }
+                    selection: original, aspect: aspect, scope: .image) { crop, selectedAspect, scope in
+                        require(selectedAspect == aspect && scope == .batch, "Batch button does not apply to the batch")
+                        committed = crop
+                    }
                 require(editor.selection == original && !editor.hasChanges, "Opening editor rewrites crop")
+                require(button(editor, "Apply to This Image").keyEquivalent == "\r", "Image is not the default scope")
                 button(editor, "Apply to Batch").performClick(nil)
                 require(committed == original, "Unedited apply rewrites crop")
                 checks += 1
             }
         }
         let crop = CropSelection(x: 0.1, y: 0.2, width: 0.5, height: 0.6, aspect: .square)
+        var appliedReset = false
         let editor = CropEditorController(itemName: "Undo", image: NSImage(size: sizes[0]), sourceSize: sizes[0],
-            selection: crop, aspect: .square) { _, _ in }
+            selection: crop, aspect: .square, scope: .batch) { selection, aspect, scope in
+                appliedReset = selection == nil && aspect == .free && scope == .image
+            }
         require(editor.window!.undoManager === editor.undoManager, "Window does not use local crop history")
+        require(button(editor, "Apply to Batch").keyEquivalent == "\r", "Batch is not the default scope")
         button(editor, "Reset").performClick(nil)
         require(editor.selection == nil && editor.aspect == .free && editor.hasChanges, "Reset did not clear crop")
         require(editor.undoManager!.canUndo, "Reset not undoable")
@@ -204,9 +212,10 @@ import Darwin
         require(button(editor, "Redo").isEnabled, "Redo disabled after direct undo")
         editor.redo(nil)
         require(editor.selection == nil && editor.aspect == .free, "Redo did not restore reset")
-        editor.close()
+        button(editor, "Apply to This Image").performClick(nil)
+        require(appliedReset, "Image button does not apply the reset to this image")
         let gesture = CropEditorController(itemName: "Gesture", image: NSImage(size: sizes[0]), sourceSize: sizes[0],
-            selection: nil, aspect: .free) { _, _ in }
+            selection: nil, aspect: .free, scope: .image) { _, _, _ in }
         gesture.window!.contentView!.layoutSubtreeIfNeeded()
         let canvas = descendants(gesture.window!.contentView!).first { String(describing: type(of: $0)) == "CropCanvas" }!
         let inset = canvas.bounds.insetBy(dx: 20, dy: 20)
@@ -248,11 +257,11 @@ import Darwin
         gesture.close()
         var applied = 0, closed = 0
         let cancel = CropEditorController(itemName: "Cancel", image: NSImage(size: sizes[0]), sourceSize: sizes[0],
-            selection: crop, aspect: .square) { _, _ in applied += 1 }
+            selection: crop, aspect: .square, scope: .batch) { _, _, _ in applied += 1 }
         cancel.onClose = { closed += 1 }
         button(cancel, "Reset").performClick(nil)
         button(cancel, "Cancel").performClick(nil)
         require(applied == 0 && closed == 1, "Cancel commits draft or fails close notification")
-        print("PASS \(checks) geometry/unchanged-apply groups plus native drag, edge resize, reset, undo, redo, cancel")
+        print("PASS \(checks) geometry/unchanged-apply groups plus native drag, edge resize, reset, undo, redo, cancel, and crop scopes")
     }
 }

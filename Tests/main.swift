@@ -1576,6 +1576,35 @@ test("PSD without a trustworthy merged composite returns a clear compatibility e
     try require(try directorySnapshot(output) == beforeOutput, "Rejected PSD produced output files")
 }
 
+test("Crop assignments follow queue identities and individual edits override batch crops") {
+    let first = UUID(), second = UUID()
+    let individual = CropSelection(width: 0.25, height: 0.5)
+    let batch = CropSelection(width: 0.5, height: 0.5)
+    var crops = CropAssignments()
+    var base = ResizeSettings()
+    base.mode = .originalDimensions
+    func plannedCrop(for id: UUID) throws -> CGRect {
+        try ResizeEngine.outputPlan(width: 120, height: 80, settings: crops.settings(for: id, base: base)).cropRect
+    }
+
+    crops.set(individual, for: first)
+    try require(try plannedCrop(for: first) == CGRect(x: 0, y: 0, width: 30, height: 40), "Individual crop was not applied")
+    try require(try plannedCrop(for: second) == CGRect(x: 0, y: 0, width: 120, height: 80), "Individual crop reached another image")
+
+    crops = CropAssignments(batch: batch)
+    try require(try plannedCrop(for: first) == plannedCrop(for: second) && crops.selection(for: first) == batch,
+                "Batch crop did not replace the earlier individual crop")
+    crops.set(nil, for: first)
+    crops.set(individual, for: second)
+    try require(crops.hasOverride(for: first) && crops.selection(for: first) == nil,
+                "An image with an explicit reset inherited the batch crop")
+    try require(crops.selection(for: second) == individual, "Individual crop did not override the batch crop")
+    try require(crops.selection(for: UUID()) == batch, "A newly queued image did not inherit the batch crop")
+    crops.removeOverrides(for: [first, second])
+    try require(!crops.hasOverride(for: first) && !crops.hasOverride(for: second) && crops.selection(for: first) == batch,
+                "Removing individual assignments changed the batch crop or left a stale edit")
+}
+
 test("Crop planning applies every resize mode to the crop before reduction or enlargement") {
     var settings = ResizeSettings()
     settings.allowUpscaling = true

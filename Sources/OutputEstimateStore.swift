@@ -36,10 +36,14 @@ final class OutputEstimateStore {
 
     func clear() { members.removeAll(keepingCapacity: true); reset() }
 
+    func invalidate(_ id: UUID) {
+        if let old = values.removeValue(forKey: id) { subtract(old) }
+    }
+
     func remove(_ ids: [UUID]) {
         for id in ids {
             members.remove(id)
-            if let old = values.removeValue(forKey: id) { subtract(old) }
+            invalidate(id)
         }
     }
 
